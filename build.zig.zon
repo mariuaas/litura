@@ -1,0 +1,35 @@
+.{
+    .name = .litura,
+    .version = "0.1.0",
+    .fingerprint = 0xcb0dac747f71e526,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zg = .{
+            .url = "https://codeberg.org/atman/zg/archive/v0.16.2.tar.gz",
+            .hash = "zg-0.16.2-oGqU3HqftgI6rwFS90ypwfjgToH8Pz829OKuFURlm773",
+        },
+        .tree_sitter = .{
+            .url = "https://github.com/tree-sitter/tree-sitter/archive/574205298283bfbec30fac611e330fc4a4431365.tar.gz",
+            .hash = "tree_sitter-0.27.0-Tw2sRyT_CwD8bjITb9xlntHqzAhR_FBzfu1HfCuw-I6Y",
+            .lazy = true,
+        },
+        .tree_sitter_lua = .{
+            .url = "https://github.com/tree-sitter-grammars/tree-sitter-lua/archive/10fe0054734eec83049514ea2e718b2a56acd0c9.tar.gz",
+            .hash = "N-V-__8AAE5ZCQA-BW5BOioWVkGcPTjhC5x1Qv07BH3Xt3dR",
+            .lazy = true,
+        },
+        // Source tree of commit 6479aa13f32f701c383083d8b28360ebd682fb7d.
+        // Its top-level Zig manifest is incompatible with Zig 0.16.0; parser contents are unchanged.
+        .tree_sitter_zig = .{
+            .url = "https://github.com/tree-sitter-grammars/tree-sitter-zig/archive/bb520eab0295ccbe46e6b510ca394d17e1f84745.tar.gz",
+            .hash = "N-V-__8AAPRJXAAEwJXx7flJG3JuHIsTmufzs3t8ukhFgmun",
+            .lazy = true,
+        },
+        .tree_sitter_fennel = .{
+            .url = "https://github.com/alexmozaidze/tree-sitter-fennel/archive/3f0f6b24d599e92460b969aabc4f4c5a914d15a0.tar.gz",
+            .hash = "N-V-__8AAE9HOACMa18NejabSo4gTomtlLo1nXV-2BSltkd7",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tests", "examples", "docs", "README.md", "LICENSE" },
+}
