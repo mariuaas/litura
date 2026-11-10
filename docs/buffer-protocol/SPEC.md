@@ -118,6 +118,20 @@ deterministic conversion boundary to protocol positions. In particular,
 tree-sitter-style syntax providers operate over UTF-8 bytes internally but must
 return normalized protocol ranges at the engine boundary.
 
+**Segmentation profile (normative).** Grapheme clusters are UAX #29 extended
+grapheme clusters for one Unicode version. The profile is fixed for the lifetime
+of a buffer. For the same text and profile, grapheme boundaries must be
+identical regardless of storage layout or of the sequence of edits that
+produced the text. Revisions, undo history, and anchor positions may depend on
+editing history; the segmentation of a given text may not.
+
+**Grapheme lengths belong to ranges, not to text.** A `Position` addresses a
+boundary of one revision's text. Grapheme counts are not additive under
+concatenation: `e` followed by U+0301 COMBINING ACUTE ACCENT is one grapheme,
+not two. An edit can therefore remove or create boundaries outside the range it
+targets (§1.4). Free-standing inserted text has no protocol grapheme length; a
+grapheme length is only defined for a range of a specific revision.
+
 ### 1.4 Anchor
 
 ```
@@ -166,13 +180,23 @@ the primitive edit events are insertion and deletion:
 E = E_ins(i, L) | E_del(d_s, d_e)
 ```
 
-where `E_ins(i, L)` inserts `L` bytes at position `i`, and `E_del(d_s, d_e)`
-deletes the half-open interval `[d_s, d_e)`.
+where `E_ins(i, L)` inserts text of `L` code points at offset `i`, and
+`E_del(d_s, d_e)` deletes the half-open interval `[d_s, d_e)`.
+
+**Algebra coordinates.** The transforms below are stated over code-point offsets
+into the logical text, not over grapheme `Position`s. Code-point lengths are
+additive under concatenation; grapheme lengths are not (§1.3). Code-point
+offsets are internal to the algebra: an engine may use any additive encoding
+coordinate (for example UTF-8 bytes) with the same result. Protocol-visible
+anchor positions are obtained by projecting the result onto the new revision's
+grapheme boundaries (see *Projection* below). Where no boundary appears or
+disappears, the transforms read identically with grapheme positions and
+grapheme lengths.
 
 Let `T(A, E) → A'` be the rebasing function, where `A'` is either `(p', s)` or
 `DEAD`.
 
-**Insertion.** For `E_ins(i, L)` — insertion of `L` bytes at position `i`:
+**Insertion.** For `E_ins(i, L)` — insertion of `L` code points at offset `i`:
 
 ```
 T_ins((p, s), E_ins(i, L)) =
@@ -215,16 +239,21 @@ Extensions that need "die if the region is touched at all" semantics should use
 content guards (`SliceHash`, `SliceEquality`) rather than relying on anchor
 death.
 
-**Replacement.** `E_repl(d_s, d_e, L)` — replace `[d_s, d_e)` with `L` bytes
-— is the strict composition of deletion followed by insertion at the deletion
-start:
+**Replacement.** `E_repl(d_s, d_e, L)` — replace `[d_s, d_e)` with text of `L`
+code points — is the strict composition of deletion followed by insertion at
+the deletion start:
 
 ```
 T_repl(A, E_repl(d_s, d_e, L)) = T_ins(T_del(A, E_del(d_s, d_e)), E_ins(d_s, L))
 ```
 
-This decomposition is normative. Engines must not implement replacement as an
-"in-place swap" that preserves interior anchors. Consequences:
+This decomposition is normative and *internal* to one operation. `T_del` and
+`T_ins` are composed over code-point offsets with no committed state, no
+resegmentation and no projection between them; the result is projected once
+(*Projection granularity*, below). It is not a statement about executing a
+`Delete` operation and then an `Insert` operation. Engines must not implement
+replacement as an "in-place swap" that preserves interior anchors.
+Consequences, in code-point offsets:
 
 - Anchor at `d_s` with Weak stickiness: survives deletion, stays at `d_s`
     (holds position through the subsequent insertion).
@@ -235,16 +264,130 @@ This decomposition is normative. Engines must not implement replacement as an
 - Anchor strictly inside `(d_s, d_e)` with Sticky stickiness: clamps to `d_s`
     during deletion, then moves to `d_s + L` under the subsequent insertion.
 
-**Composition.** Rebasing across edits `e1, e2` equals rebasing across `e1` then
-`e2`:
+#### Requested Edits and Realized Splices
+
+Every `BufferOp` (§4.1) is a *requested edit*: replace the grapheme range
+`[r_s, r_e)` of the current text state with UTF-8 text `T` (`Insert` has
+`r_s = r_e`; `Delete` has empty `T`). The requested edit does not determine
+how many graphemes the result contains, because `T` can merge with its
+neighbours and change boundaries beyond `[r_s, r_e)`.
+
+The *realized splice* of a requested edit is the minimal grapheme range of the
+old revision whose rewrite accounts for every changed boundary:
+
+```
+Splice = {
+    start   : Position   -- ≤ r_s; a boundary in both revisions
+    old_end : Position   -- ≥ r_e; old-revision coordinate
+    new_end : Position   -- new-revision coordinate
+}
+```
+
+- `start = r_s` if `r_s` is still a boundary after the edit; otherwise
+  `r_s - 1`.
+- `old_end` is the least old boundary `q ≥ r_e` whose image after the edit is
+  also a boundary of the new text.
+- `new_end` is `start` plus the number of graphemes in the new text between
+  `start` and the image of `old_end`.
+
+Old graphemes `[start, old_end)` become new graphemes `[start, new_end)`.
+Graphemes outside the splice are unchanged in content, and positions at or after
+`old_end` shift by `(new_end - start) - (old_end - start)`. The splice is
+*aligned* when `start = r_s` and `old_end = r_e`. Graphemes inside the splice
+but outside `[r_s, r_e)` are *context*: they are rewritten, not deleted.
+
+Example: in `e`, inserting U+0301 at `1` realizes the splice `[0, 1) → [0, 1)`.
+The text changed; the grapheme count did not. In `e␤◌́` (three graphemes),
+deleting `[1, 2)` realizes `[0, 3) → [0, 1)` with result `é`.
+
+**Locality (normative, profile-qualified).** For the extended grapheme cluster
+rules of the buffer's profile, an engine may rely on, and must verify for its
+Unicode version, two properties:
+
+1. A boundary depends only on the text before it and the single code point
+   after it. An edit therefore cannot change boundaries before `r_s`, and a
+   splice widens left by at most one grapheme.
+2. Segmentation restarted at any boundary reproduces whole-text segmentation
+   after that boundary. Regional-indicator pairing (GB12/GB13) is the only rule
+   that looks back across a boundary, and a boundary between two indicators
+   implies an even count of indicators before it. Once old and new
+   segmentations share a boundary after the edit, they agree from there on.
+
+Neither property bounds the right extent. One regional indicator inserted
+before a run of `2k` indicators re-pairs the entire run, so `old_end - r_e` is
+unbounded. Individual graphemes are also unbounded in length (combining-mark
+runs, Hangul jamo runs, Indic conjuncts, emoji ZWJ sequences). Realizing a
+splice costs time proportional to its extent; engines must not truncate a
+splice to bound that cost. Both properties hold for every case of the Unicode
+16.0.0 `GraphemeBreakTest.txt`; an engine adopting another Unicode version must
+re-verify them against that version's data.
+
+**Projection (normative).** An anchor `(p, s)` is rebased across a requested
+edit by applying `T_repl` to its code-point offset with the requested deletion
+`[r_s, r_e)` and the code-point length of `T`, then projecting the result `c'`
+onto the new revision's boundaries:
+
+```
+project(c', Weak)   = greatest new boundary ≤ c'
+project(c', Sticky) = least new boundary ≥ c'
+```
+
+When `c'` is a boundary, both cases return it. Otherwise the anchor's boundary
+has disappeared, and each stickiness keeps its defining guarantee relative to
+the inserted text: a Weak anchor stays before every inserted code point, and a
+Sticky anchor stays after every inserted code point. The cost is that the anchor
+also crosses the neighbouring text that the inserted text merged with.
+
+- In `e`, insert U+0301 at `1`. Weak `1 → 0`; Sticky `1 → 1`.
+- In `🇳🇴🇸🇪`, insert `🇦` at `0`. The result pairs as `(🇦🇳)(🇴🇸)(🇪)`.
+  An anchor at old position `1` lands inside `(🇴🇸)`: Weak `1 → 1`,
+  Sticky `1 → 2`.
+
+Positions outside the splice need no projection. Inside an aligned splice the
+rule reduces exactly to the grapheme formulas above, with `L = new_end - start`.
+
+**Non-deletion rule (normative).** Resegmentation is not deletion. Only the
+requested deletion `[r_s, r_e)` kills anchors, under `T_del`: Weak anchors
+strictly inside `(r_s, r_e)` die. An anchor whose boundary disappears through
+resegmentation, including any anchor inside the splice's context, is projected
+and never killed, and creates no `DeletionMeta` record (§2.5.2).
+
+**Projection granularity (normative).** Projection is applied once per
+`BufferOp`, onto the boundaries of the text state that operation produces.
+Each operation in a payload produces such a state, even though the payload
+commits a single revision (§4.1). Two levels of composition must therefore be
+distinguished:
+
+- *Internal decomposition.* Within one operation, `T_repl = T_ins ∘ T_del`
+  holds exactly over code-point offsets, as stated under *Replacement*.
+  Neither the text nor the coordinates are resegmented between the two steps.
+- *Sequential operations.* Across operations, each operation is resegmented
+  and projected before the next is resolved. The next operation's grapheme
+  coordinates refer to that resegmented state.
+
+A `Replace` operation is therefore not equivalent to a `Delete` operation
+followed by an `Insert` operation, in text or in anchors, whether the two are
+in one payload or in separate intents. In `e␤◌́`:
+
+- `Replace([1, 2), "a")` yields `e` `á`: the inserted `a` takes the accent.
+- `Delete(1, 2)` then `Insert(1, "a")` yields `é` `a`: after the deletion
+  the text is the single grapheme `é`, so position `1` is after the accent.
+
+**Composition.** Rebasing across sequential operations `e1, e2` equals rebasing
+across `e1` then `e2`:
 
 ```
 T(A, e1 · e2) = T(T(A, e1), e2)
 ```
 
+where each `T` is the projected transform of one complete operation, applied
+to the state that operation produced. This law composes operations; it does not
+license an engine to split one operation into separately projected parts, or to
+merge separate operations into one projection.
+
 For live anchors, `T(DEAD, e) = DEAD` for all `e`. Dead anchors do not
 participate in rebasing. Resurrection is handled exclusively by the undo system
-(§1.6), not by the rebasing algebra.
+(§2.5), not by the rebasing algebra.
 
 **Tie-breaking.** Multiple insertions at the same logical position are ordered
 by `(revision, operation_index)`. Anchors rebased across equal-position inserts
@@ -331,6 +474,13 @@ summary_range(range: Range) -> Summary
 
 Implementation (Fenwick tree, balanced tree, etc.) is not normative. The algebra
 and query interface are.
+
+Composition is defined for adjacent ranges of one revision that meet at a
+grapheme boundary. It is not a rule for concatenating independently summarized
+text: `summary("e")` composed with `summary(U+0301)` is not
+`summary("e" + U+0301)`. An engine that stores summaries per storage unit must
+either keep every unit boundary at a grapheme boundary of the logical text, or
+correct the junctions where it does not.
 
 #### Summary Extensibility
 
@@ -811,6 +961,21 @@ time. The engine must not attempt to reconstruct inverse operations from
 revision history. Deleted text is retained via the existing immutable
 piece-table stores.
 
+**Normative constraint (splice inverse):** The inverse of a `BufferOp` is
+derived from its realized splice (§1.4), not from the requested text:
+
+```
+inverse(op) = Replace { target: [start, new_end), text: old_text[start, old_end) }
+```
+
+where `old_text` includes the splice's context. Engines may write it as
+`Insert` when `new_end = start`, or `Delete` when the old text is empty. A grapheme
+length computed from the requested text must not be used. Example: inserting
+U+0301 after `e` realizes `[0, 1) → [0, 1)`. Its inverse is `Replace([0, 1), "e")`,
+which restores `e`; "delete one grapheme at 1" is out of range, and "delete
+`[0, 1)`" removes too much. Applied to the revision its operation produced, an
+inverse realizes an aligned splice, so undo and redo restore text exactly.
+
 **Normative constraint (undo boundary):** Undo operations strictly capture and
 restore buffer state. Interaction state (selections, registers) is not recorded
 in the undo lineage. Pure interaction mutations do not generate an `UndoEntry`.
@@ -844,12 +1009,17 @@ DeadAnchorRecord = {
 **Constraints:**
 
 - Exactly one hidden live anchor (`target_anchor`) per deletion unit, placed at
-    the deletion boundary with `Weak` stickiness. This anchor participates in
-    normal rebasing and tracks coordinate drift from intervening edits.
-- Dead anchors are stored as relative offsets within the deleted region, not as
+    the realized splice's `start` with `Weak` stickiness. This anchor
+    participates in normal rebasing and tracks coordinate drift from
+    intervening edits. The splice start is used rather than the requested
+    deletion start because the requested start can stop being a boundary: in
+    `e␤X␤◌́`, deleting `[1, 4)` leaves `é`, and position `1` no longer exists.
+- Dead anchors are stored as offsets relative to the splice start, not as
   absolute positions. This makes the metadata immune to coordinate drift.
-- The `inverse_text` field references the deleted content (may be a reference
-  into an immutable store rather than a copy).
+  Undo restores the splice's old text at the target anchor, so `target + offset`
+  is the anchor's original position.
+- The `inverse_text` field references the splice's old text, including context
+  (may be a reference into an immutable store rather than a copy).
 
 ### 2.5.3 Undo Application
 
@@ -888,6 +1058,13 @@ Resurrection is forbidden in all other cases:
 
 This is what distinguishes lineage-based resurrection from geometric matching.
 The identity of the deletion — not its shape — is what authorizes restoration.
+
+Anchors moved by projection (§1.4) are not dead, so undo does not restore their
+earlier positions. They undergo ordinary rebasing across the inverse
+operation. In `e`, a Weak anchor at `1` projects to `0` when U+0301 is
+inserted; undoing the insertion leaves it at `0`. This follows the design
+principle above: anchors model spatial continuity, and resegmentation does not
+create undo lineage.
 
 ### 2.5.5 Redo
 
@@ -1241,6 +1418,18 @@ applying operations front-to-back with sequential rebasing is isomorphic to
 applying them back-to-front without rebasing. Engines may detect this property
 and bypass the O(N²) rebasing matrix, applying the payload in O(N). This is a
 provable equivalence, not an approximation.
+
+Positions before a realized splice's `start` are unchanged (§1.4), so the
+identity holds for positions. Content does not: a splice extends left into
+the preceding grapheme when its own start boundary disappears. An operation
+whose target ends exactly where an earlier-applied operation begins may
+therefore address a grapheme that operation rewrote. On `ae`,
+`[Insert(2, U+0301), Delete(1, 2)]` deletes `é`, not `e`. Clients that compute
+a payload from one snapshot must not assume adjacent targets are independent.
+
+Because grapheme deltas depend on realized splices, validating operation N
+against the sequential model requires the realized effect of operations
+0..N-1, not lengths computed from their requested text.
 
 ### 4.2 Intent
 
@@ -1833,6 +2022,10 @@ EventSource =
 
 `Compaction` events have empty `affected_ranges`. They signal that internal
 layout changed but logical text did not.
+
+For each `BufferOp`, `affected_ranges` reports the realized splice's new range
+`[start, new_end)` (§1.4). This can extend beyond the requested target, and can
+be non-empty with an unchanged grapheme count.
 
 Two subscriber classes exist with respect to compaction:
 
@@ -2531,3 +2724,13 @@ Items deferred from this draft, required before stabilization:
     acknowledgment, and queue reconciliation (§7.1, §7.2). Distributed merge
     semantics (e.g., peer-to-peer CRDTs or multi-user operational
     transformation) remain deferred as an external coordination layer.
+11. **Coordinate rebasing outside the engine**: open. Grapheme coordinates are
+    not additive (§1.3), so rebasing a position across an edit requires the
+    realized splice, the requested range, and enough text to project (§1.4).
+    `affected_ranges` alone is insufficient for §6.2 positional rebasing and
+    §7.2 client reconciliation. A client that rebases speculatively must also
+    segment with the same profile as the engine. Proposed resolution:
+    `EditEvent` carries realized splices (old and new extents), and
+    `EngineCapabilities` advertises the segmentation profile (for example
+    `"UAX29-extended/16.0.0"`). Changing the profile of an existing buffer is a
+    coordinate migration, not an edit, and is unspecified.

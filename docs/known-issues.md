@@ -10,6 +10,10 @@ The v0.1 specification is authoritative but remains a draft. These implementatio
 
 Undo/redo error recovery discards allocation failures while restoring history entries. Provider destruction also allocates a temporary identity set and discards insertion failures, risking repeated destruction of shared provider state under memory pressure. Tree rebalancing has `catch unreachable` on list operations without a documented local capacity proof; that capacity invariant needs verification. These error paths require correctness work, not replacement with different unchecked failure handling during a style pass.
 
+Multi-operation validation estimates each operation's grapheme delta from the inserted text alone. Edits apply exactly, but an edit can merge neighbouring graphemes (`e` + U+0301), so the estimate is an upper bound: a later operation in the same payload may pass validation and then fail with `OutOfRange` after earlier operations were applied. Single-operation payloads are validated exactly.
+
+zg 0.16.2's `Graphemes.Iterator` sums cluster length in a `u8`, so a grapheme longer than 255 bytes panics in safe builds and is mismeasured otherwise. `text_segmentation.Iterator` drives zg's `graphemeBreak` with a full-width length instead; remove it once upstream is fixed.
+
 ## Interaction and provider revisions
 
 `moveAnchor` checks only that an anchor exists. It accepts out-of-bounds positions and does not increment session interaction revisions. Higher-level interaction intents validate positions and advance revisions. The direct path remains observable and is characterized by a test; changing it requires deciding which pathway is authoritative.

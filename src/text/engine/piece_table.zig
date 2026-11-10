@@ -706,14 +706,121 @@ pub const PieceTable = struct {
         return null;
     }
 
+    /// A requested replacement widened to grapheme boundaries that exist both before and
+    /// after the edit. Old graphemes [start, old_end) become new graphemes [start, new_end).
+    /// Context graphemes are unrequested neighbours rewritten because their boundaries changed.
+    pub const Splice = struct {
+        start: u32,
+        old_end: u32,
+        new_end: u32,
+        left_context: u32 = 0,
+        right_context: u32 = 0,
+        left_context_bytes: u32 = 0,
+        right_context_bytes: u32 = 0,
+
+        pub fn isAligned(self: Splice) bool {
+            return self.left_context == 0 and self.right_context == 0;
+        }
+
+        pub fn requestedStart(self: Splice) u32 {
+            return self.start + self.left_context;
+        }
+
+        pub fn requestedEnd(self: Splice) u32 {
+            return self.old_end - self.right_context;
+        }
+    };
+
     pub fn insert(self: *PieceTable, pos: u32, text: []const u8) !void {
-        try self.validatePosition(pos);
-        if (text.len == 0) return;
+        try self.replace(pos, pos, text);
+    }
+
+    pub fn delete(self: *PieceTable, start: u32, end: u32) !void {
+        try self.replace(start, end, "");
+    }
+
+    pub fn replace(self: *PieceTable, start: u32, end: u32, text: []const u8) !void {
+        try self.applySplice(try self.planReplace(start, end, text), text);
+    }
+
+    /// Plans replacing [start, end) with text without mutating the table.
+    /// Boundaries before the edit cannot change, and UAX #29 segmentation restarted at a
+    /// boundary reproduces the whole-text result. The plan therefore starts at the last
+    /// surviving boundary and extends right until old and new segmentations share one.
+    pub fn planReplace(self: *const PieceTable, start: u32, end: u32, text: []const u8) !Splice {
+        try self.validateRange(start, end);
+
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(self.allocator);
+        if (start > 0) try scratch.appendSlice(self.allocator, try self.graphemeAt(start - 1));
+        const left_bytes = scratch.items.len;
+        try scratch.appendSlice(self.allocator, text);
+
+        var right = try self.graphemeCursor(end);
+        var right_context: u32 = 0;
+        var right_bytes: usize = 0;
+        var left_aligned = true;
+        var from: usize = 0;
+        while (true) {
+            const target = scratch.items.len;
+            const lookahead: []const u8 = if (right.valid) try right.current() else "";
+            try scratch.appendSlice(self.allocator, lookahead);
+            if (right_context == 0 and left_bytes > 0) {
+                const left = boundaryFrom(scratch.items, 0, left_bytes);
+                left_aligned = left.found;
+                from = left.last;
+            }
+            const probe = boundaryFrom(scratch.items, from, target);
+            from = probe.last;
+            if (probe.found) {
+                scratch.shrinkRetainingCapacity(target);
+                break;
+            }
+            right_context += 1;
+            right_bytes += lookahead.len;
+            _ = right.advance();
+        }
+
+        const left_context: u32 = if (left_aligned) 0 else 1;
+        const region = scratch.items[if (left_aligned) left_bytes else 0..];
+        const region_start = start - left_context;
+        return .{
+            .start = region_start,
+            .old_end = end + right_context,
+            .new_end = region_start + @as(u32, @intCast(segmentation.graphemeCount(region))),
+            .left_context = left_context,
+            .right_context = right_context,
+            .left_context_bytes = if (left_aligned) 0 else @intCast(left_bytes),
+            .right_context_bytes = @intCast(right_bytes),
+        };
+    }
+
+    /// Applies a plan from planReplace to the table it was planned against. Rewritten
+    /// context is copied with the text so every piece boundary stays a grapheme boundary.
+    pub fn applySplice(self: *PieceTable, splice: Splice, text: []const u8) !void {
+        if (splice.isAligned()) {
+            if (splice.start != splice.old_end) try self.deleteAligned(splice.start, splice.old_end);
+            if (text.len == 0) return;
+            const add_offset = self.add_buf.items.len;
+            try self.add_buf.appendSlice(self.allocator, text);
+            return self.insertAdded(splice.start, add_offset, text.len);
+        }
+
+        const left = try self.getTextRange(splice.start, splice.requestedStart());
+        defer self.allocator.free(left);
+        const right = try self.getTextRange(splice.requestedEnd(), splice.old_end);
+        defer self.allocator.free(right);
 
         const add_offset = self.add_buf.items.len;
+        try self.add_buf.appendSlice(self.allocator, left);
         try self.add_buf.appendSlice(self.allocator, text);
+        try self.add_buf.appendSlice(self.allocator, right);
+        try self.deleteAligned(splice.start, splice.old_end);
+        try self.insertAdded(splice.start, add_offset, self.add_buf.items.len - add_offset);
+    }
 
-        const inserted_pieces = try self.makePiecesChunked(.add, add_offset, text.len);
+    fn insertAdded(self: *PieceTable, pos: u32, add_offset: usize, len: usize) !void {
+        const inserted_pieces = try self.makePiecesChunked(.add, add_offset, len);
         defer self.allocator.free(inserted_pieces);
 
         var current_pos = pos;
@@ -730,10 +837,7 @@ pub const PieceTable = struct {
         }
     }
 
-    pub fn delete(self: *PieceTable, start: u32, end: u32) !void {
-        try self.validateRange(start, end);
-        if (start == end) return;
-
+    fn deleteAligned(self: *PieceTable, start: u32, end: u32) !void {
         _ = try self.deleteFrom(self.root, start, end);
         try self.normalizeRoot();
     }
@@ -1303,6 +1407,26 @@ pub const PieceTable = struct {
         return result.toOwnedSlice(self.allocator);
     }
 };
+
+const Boundary = struct {
+    found: bool,
+    last: usize,
+};
+
+/// Segments bytes from a known boundary and reports whether target is a boundary.
+/// `last` is the greatest boundary at or before target, a valid restart point.
+fn boundaryFrom(bytes: []const u8, from: usize, target: usize) Boundary {
+    if (target == from or target == bytes.len) return .{ .found = true, .last = target };
+    var iter = segmentation.graphemeIterator(bytes[from..]);
+    var last = from;
+    while (iter.inner.next()) |gc| {
+        const offset = from + gc.offset;
+        if (offset == target) return .{ .found = true, .last = offset };
+        if (offset > target) break;
+        last = offset;
+    }
+    return .{ .found = false, .last = last };
+}
 
 fn freeNode(allocator: std.mem.Allocator, node: nodes.NodeRef) void {
     switch (node) {

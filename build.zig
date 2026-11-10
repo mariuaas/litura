@@ -30,6 +30,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     tests.root_module.addImport("litura", module);
+    // Conformance data for the Unicode version zg implements.
+    tests.root_module.addAnonymousImport("grapheme_break_test", .{
+        .root_source_file = zg.path("data/unicode/auxiliary/GraphemeBreakTest.txt"),
+    });
     const units = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/unit_tests.zig"),
         .target = target,
@@ -74,6 +78,7 @@ fn configureModule(
     syntax: ?SyntaxSources,
 ) void {
     module.addImport("zg_graphemes", zg.module("Graphemes"));
+    module.addImport("zg_code_point", zg.module("code_point"));
     module.addImport("zg_properties", zg.module("Properties"));
     module.addImport("zg_words", zg.module("Words"));
     const sources = syntax orelse return;

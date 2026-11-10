@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Graphemes = @import("zg_graphemes");
+const code_point = @import("zg_code_point");
 
 pub const Split = struct {
     left: []const u8,
@@ -10,7 +11,7 @@ pub const Split = struct {
 
 /// Count grapheme clusters in text without constructing a segmenter.
 pub fn graphemeCount(text: []const u8) usize {
-    var iter = Graphemes.iterator(text);
+    var iter = Iterator.init(text);
     var n: usize = 0;
     while (iter.next()) |_| n += 1;
     return n;
@@ -18,7 +19,7 @@ pub fn graphemeCount(text: []const u8) usize {
 
 /// Iterate grapheme clusters as byte slices of the source string.
 pub fn graphemeIterator(text: []const u8) ClusterIterator {
-    return .{ .inner = Graphemes.iterator(text), .text = text };
+    return .{ .inner = Iterator.init(text), .text = text };
 }
 
 /// Split text at a grapheme-cluster offset, returning two slices of the
@@ -27,7 +28,7 @@ pub fn splitAtGraphemeOffset(
     text: []const u8,
     offset: usize,
 ) error{OutOfRange}!Split {
-    var iter = Graphemes.iterator(text);
+    var iter = Iterator.init(text);
     var i: usize = 0;
     while (iter.next()) |gc| : (i += 1) {
         if (i == offset) {
@@ -90,7 +91,7 @@ pub const Segmenter = struct {
         var offsets: std.ArrayListUnmanaged(u32) = .empty;
         errdefer offsets.deinit(allocator);
         try offsets.append(allocator, 0);
-        var iter = Graphemes.iterator(text);
+        var iter = Iterator.init(text);
         while (iter.next()) |gc| {
             try offsets.append(allocator, gc.offset + gc.len);
         }
@@ -98,9 +99,41 @@ pub const Segmenter = struct {
     }
 };
 
+/// Extended grapheme cluster iterator using zg's break rules. zg 0.16.2's own
+/// Iterator sums cluster length in a u8 and overflows past 255 bytes, so this
+/// mirrors its loop with a full-width length.
+pub const Iterator = struct {
+    buf: [2]?code_point.CodePoint = .{ null, null },
+    cp_iter: code_point.Iterator,
+
+    pub fn init(text: []const u8) Iterator {
+        var self: Iterator = .{ .cp_iter = .{ .bytes = text } };
+        self.advance();
+        return self;
+    }
+
+    fn advance(self: *Iterator) void {
+        self.buf[0] = self.buf[1];
+        self.buf[1] = self.cp_iter.next();
+    }
+
+    pub fn next(self: *Iterator) ?Graphemes.Grapheme {
+        self.advance();
+        const first = self.buf[0] orelse return null;
+        var len: code_point.uoffset = first.len;
+        var state: Graphemes.IterState = .{};
+        while (self.buf[1]) |following| {
+            if (Graphemes.graphemeBreak(self.buf[0].?.code, following.code, &state)) break;
+            self.advance();
+            len += self.buf[0].?.len;
+        }
+        return .{ .offset = first.offset, .len = len };
+    }
+};
+
 /// Yields grapheme clusters as byte slices into the source string.
 pub const ClusterIterator = struct {
-    inner: Graphemes.Iterator,
+    inner: Iterator,
     text: []const u8,
 
     pub fn next(self: *ClusterIterator) ?[]const u8 {
@@ -224,4 +257,13 @@ test "graphemeToByteMap with combining sequence" {
     defer allocator.free(map);
 
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 4 }, map);
+}
+
+test "clusters longer than 255 bytes are measured exactly" {
+    var text: [1 + 2 * 300]u8 = undefined;
+    text[0] = 'e';
+    for (0..300) |i| @memcpy(text[1 + 2 * i ..][0..2], "\u{0301}");
+    var iter = graphemeIterator(&text);
+    try std.testing.expectEqual(text.len, iter.next().?.len);
+    try std.testing.expect(iter.next() == null);
 }

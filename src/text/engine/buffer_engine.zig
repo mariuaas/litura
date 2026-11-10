@@ -71,10 +71,22 @@ pub const BufferEngine = struct {
         }
     };
 
-    const PreparedOp = struct {
-        op: types.BufferOp,
-        inserted_graphemes: u32,
+    const Splice = piece_table.PieceTable.Splice;
+
+    /// Every buffer operation is a replacement of [start, end) with text.
+    const RequestedEdit = struct {
+        start: u32,
+        end: u32,
+        text: []const u8,
     };
+
+    fn requestedEdit(op: types.BufferOp) RequestedEdit {
+        return switch (op) {
+            .insert => |ins| .{ .start = ins.pos, .end = ins.pos, .text = ins.text },
+            .delete => |del| .{ .start = del.start, .end = del.end, .text = "" },
+            .replace => |rep| .{ .start = rep.start, .end = rep.end, .text = rep.text },
+        };
+    }
 
     /// Creates an empty owning engine. Release it with deinit.
     pub fn init(allocator: std.mem.Allocator) !BufferEngine {
@@ -693,108 +705,134 @@ pub const BufferEngine = struct {
         return count;
     }
 
-    fn inverseForOp(self: *const BufferEngine, prepared: PreparedOp) !types.BufferOp {
-        switch (prepared.op) {
-            .insert => |ins| return .{ .delete = .{ .start = ins.pos, .end = ins.pos + prepared.inserted_graphemes } },
-            .delete => |del| return .{ .insert = .{ .pos = del.start, .text = try self.table.getTextRange(del.start, del.end) } },
-            .replace => |rep| return .{ .replace = .{
-                .start = rep.start,
-                .end = rep.start + prepared.inserted_graphemes,
-                .text = try self.table.getTextRange(rep.start, rep.end),
-            } },
+    /// Takes ownership of old_text, the exact text of the splice's old range.
+    fn inverseForSplice(self: *const BufferEngine, splice: Splice, old_text: []u8) types.BufferOp {
+        if (old_text.len == 0) {
+            self.allocator.free(old_text);
+            return .{ .delete = .{ .start = splice.start, .end = splice.new_end } };
         }
+        if (splice.new_end == splice.start) return .{ .insert = .{ .pos = splice.start, .text = old_text } };
+        return .{ .replace = .{ .start = splice.start, .end = splice.new_end, .text = old_text } };
     }
 
-    fn rebaseAnchorsForInsert(self: *BufferEngine, pos: u32, length: u32) !void {
-        if (length == 0) return;
-        var iter = self.anchors_map.valueIterator();
+    /// Byte offsets of grapheme boundaries in a splice's old and new region text.
+    const SpliceBoundaries = struct {
+        old: []u32,
+        new: []u32,
+
+        fn init(
+            engine: *const BufferEngine,
+            splice: Splice,
+            inserted: []const u8,
+            old_text: []const u8,
+        ) !SpliceBoundaries {
+            const new_text = try std.mem.concat(engine.allocator, u8, &.{
+                old_text[0..splice.left_context_bytes],
+                inserted,
+                old_text[old_text.len - splice.right_context_bytes ..],
+            });
+            defer engine.allocator.free(new_text);
+            const old = try engine.table.seg.graphemeToByteMap(engine.allocator, old_text);
+            errdefer engine.allocator.free(old);
+            return .{ .old = old, .new = try engine.table.seg.graphemeToByteMap(engine.allocator, new_text) };
+        }
+
+        fn deinit(self: *SpliceBoundaries, allocator: std.mem.Allocator) void {
+            allocator.free(self.old);
+            allocator.free(self.new);
+            self.* = undefined;
+        }
+    };
+
+    /// SPEC §1.4 replacement rebasing over byte offsets, so it stays additive when
+    /// grapheme counts are not. Null means the anchor dies.
+    fn rebaseByte(
+        x: u32,
+        deleted_start: u32,
+        deleted_end: u32,
+        inserted_len: u32,
+        stickiness: anchors.AnchorStickiness,
+    ) ?u32 {
+        if (x < deleted_start) return x;
+        if (x > deleted_end) return x - (deleted_end - deleted_start) + inserted_len;
+        if (stickiness == .sticky) return deleted_start + inserted_len;
+        if (x > deleted_start and x < deleted_end) return null;
+        return deleted_start;
+    }
+
+    /// Projects a byte offset to a grapheme boundary index: weak rounds down, sticky up.
+    fn projectToBoundary(bounds: []const u32, x: u32, stickiness: anchors.AnchorStickiness) u32 {
+        var lo: usize = 0;
+        var hi: usize = bounds.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (bounds[mid] < x) lo = mid + 1 else hi = mid;
+        }
+        if (lo < bounds.len and bounds[lo] == x) return @intCast(lo);
+        return @intCast(if (stickiness == .sticky) lo else lo - 1);
+    }
+
+    /// Maps a position inside [splice.start, splice.old_end]. Aligned splices need no
+    /// boundaries: the region is exactly the requested range.
+    fn spliceRegionPosition(
+        splice: Splice,
+        boundaries: ?SpliceBoundaries,
+        inserted_len: usize,
+        position: u32,
+        stickiness: anchors.AnchorStickiness,
+    ) ?u32 {
+        const bounds = boundaries orelse {
+            if (stickiness == .sticky) return splice.new_end;
+            if (position > splice.start and position < splice.old_end) return null;
+            return splice.start;
+        };
+        const old_len = bounds.old[bounds.old.len - 1];
+        const byte = rebaseByte(
+            bounds.old[position - splice.start],
+            splice.left_context_bytes,
+            old_len - splice.right_context_bytes,
+            @intCast(inserted_len),
+            stickiness,
+        ) orelse return null;
+        return splice.start + projectToBoundary(bounds.new, byte, stickiness);
+    }
+
+    /// Rebases anchors across one realized splice. Resegmentation never kills an anchor;
+    /// only weak anchors strictly inside the requested deletion die.
+    fn rebaseAnchorsForSplice(
+        self: *BufferEngine,
+        splice: Splice,
+        inserted: []const u8,
+        old_text: []const u8,
+    ) !void {
+        // Built on first use: long resegmentations rarely contain anchors.
+        var boundaries: ?SpliceBoundaries = null;
+        defer if (boundaries) |*b| b.deinit(self.allocator);
+
         var bumped_sessions = std.AutoHashMap(u32, void).init(self.allocator);
         defer bumped_sessions.deinit();
         try bumped_sessions.ensureTotalCapacity(self.sessions.count());
 
-        while (iter.next()) |anchor| {
-            if (anchor.status == .dead) continue;
-
-            var moved = false;
-            if (anchor.position > pos) {
-                anchor.position += length;
-                moved = true;
-            } else if (anchor.position == pos and anchor.stickiness == .sticky) {
-                anchor.position += length;
-                moved = true;
-            }
-
-            if (moved) {
-                // Check which sessions this anchor belongs to and bump revision
-                var sess_iter = self.sessions.valueIterator();
-                while (sess_iter.next()) |sess| {
-                    if (bumped_sessions.contains(sess.id)) continue;
-                    var belongs = false;
-                    for (sess.interaction.cursors.items) |cursor| {
-                        if (cursor.anchor.value == anchor.id.value or
-                            (cursor.mark != null and cursor.mark.?.value == anchor.id.value))
-                        {
-                            belongs = true;
-                            break;
-                        }
-                    }
-                    if (belongs) {
-                        sess.interaction.revision += 1;
-                        bumped_sessions.putAssumeCapacity(sess.id, {});
-                    }
-                }
-            }
-        }
-    }
-
-    fn rebaseAnchorsForDelete(self: *BufferEngine, start: u32, end: u32) !void {
-        if (start == end) return;
-        const length = end - start;
         var iter = self.anchors_map.valueIterator();
-        var bumped_sessions = std.AutoHashMap(u32, void).init(self.allocator);
-        defer bumped_sessions.deinit();
-        try bumped_sessions.ensureTotalCapacity(self.sessions.count());
-
         while (iter.next()) |anchor| {
             if (anchor.status == .dead) continue;
-            if (anchor.position <= start) continue;
-
-            var moved = false;
-            if (anchor.position < end) {
-                if (anchor.stickiness == .sticky) {
-                    anchor.position = start;
-                    moved = true;
-                } else {
-                    anchor.status = .dead;
-                    moved = true;
+            const next = if (anchor.position < splice.start)
+                anchor.position
+            else if (anchor.position > splice.old_end)
+                anchor.position - splice.old_end + splice.new_end
+            else blk: {
+                if (boundaries == null and !splice.isAligned()) {
+                    boundaries = try SpliceBoundaries.init(self, splice, inserted, old_text);
                 }
-            } else if (anchor.position == end) {
-                anchor.position = start;
-                moved = true;
+                break :blk spliceRegionPosition(splice, boundaries, inserted.len, anchor.position, anchor.stickiness);
+            };
+            if (next) |position| {
+                if (position == anchor.position) continue;
+                anchor.position = position;
             } else {
-                anchor.position -= length;
-                moved = true;
+                anchor.status = .dead;
             }
-
-            if (moved) {
-                var sess_iter = self.sessions.valueIterator();
-                while (sess_iter.next()) |sess| {
-                    if (bumped_sessions.contains(sess.id)) continue;
-                    var belongs = false;
-                    for (sess.interaction.cursors.items) |cursor| {
-                        if (cursor.anchor.value == anchor.id.value or
-                            (cursor.mark != null and cursor.mark.?.value == anchor.id.value))
-                        {
-                            belongs = true;
-                            break;
-                        }
-                    }
-                    if (belongs) {
-                        sess.interaction.revision += 1;
-                        bumped_sessions.putAssumeCapacity(sess.id, {});
-                    }
-                }
-            }
+            try self.bumpSessionsForAnchorId(anchor.id, &bumped_sessions);
         }
     }
 
@@ -818,18 +856,22 @@ pub const BufferEngine = struct {
         }
     }
 
-    fn deletedTextForInverseOp(inverse_op: types.BufferOp) []const u8 {
+    fn restoredText(inverse_op: types.BufferOp) []const u8 {
         return switch (inverse_op) {
             .insert => |ins| ins.text,
             .replace => |rep| rep.text,
-            else => unreachable,
+            .delete => "",
         };
     }
 
+    /// Records weak anchors strictly inside the requested deletion [start, end). Offsets
+    /// are relative to region_start, which survives the edit and is where undo restores
+    /// the splice's old text.
     fn captureDeletionMeta(
         self: *BufferEngine,
         start: u32,
         end: u32,
+        region_start: u32,
         inverse_op: types.BufferOp,
     ) !?types.DeletionMeta {
         if (start == end) return null;
@@ -848,17 +890,17 @@ pub const BufferEngine = struct {
 
             try dead_anchors.append(self.allocator, .{
                 .anchor = anchor.id,
-                .offset = anchor.position - start,
+                .offset = anchor.position - region_start,
                 .stickiness = anchor.stickiness,
             });
         }
 
         if (dead_anchors.items.len == 0) return null;
 
-        const target_anchor = try self.createAnchor(start, .weak);
+        const target_anchor = try self.createAnchor(region_start, .weak);
         errdefer self.dropAnchor(target_anchor) catch {};
 
-        const inverse_text = try self.allocator.dupe(u8, deletedTextForInverseOp(inverse_op));
+        const inverse_text = try self.allocator.dupe(u8, restoredText(inverse_op));
         errdefer self.allocator.free(inverse_text);
 
         return .{
@@ -892,21 +934,6 @@ pub const BufferEngine = struct {
             }
 
             try self.dropAnchor(meta.target_anchor);
-        }
-    }
-
-    fn applyOne(self: *BufferEngine, prepared: PreparedOp) !void {
-        switch (prepared.op) {
-            .insert => |ins| {
-                try self.table.insert(ins.pos, ins.text);
-            },
-            .delete => |del| {
-                try self.table.delete(del.start, del.end);
-            },
-            .replace => |rep| {
-                try self.table.delete(rep.start, rep.end);
-                try self.table.insert(rep.start, rep.text);
-            },
         }
     }
 
@@ -944,9 +971,6 @@ pub const BufferEngine = struct {
     ) !MutationCommit {
         if (ops.len == 0) return error.InvalidArgument;
 
-        var prepared_ops = try std.ArrayListUnmanaged(PreparedOp).initCapacity(self.allocator, ops.len);
-        defer prepared_ops.deinit(self.allocator);
-
         var inverse_ops = try std.ArrayListUnmanaged(types.BufferOp).initCapacity(self.allocator, ops.len);
         errdefer {
             for (inverse_ops.items) |inv| {
@@ -970,57 +994,22 @@ pub const BufferEngine = struct {
         }
 
         for (ops) |op| {
-            var inserted: u32 = 0;
-            switch (op) {
-                .insert => |ins| inserted = self.countGraphemes(ins.text),
-                .replace => |rep| inserted = self.countGraphemes(rep.text),
-                else => {},
-            }
-            const prep = PreparedOp{ .op = op, .inserted_graphemes = inserted };
-            prepared_ops.appendAssumeCapacity(prep);
-
-            const inv = try self.inverseForOp(prep);
+            const edit = requestedEdit(op);
+            const splice = try self.table.planReplace(edit.start, edit.end, edit.text);
+            const inv = self.inverseForSplice(splice, try self.table.getTextRange(splice.start, splice.old_end));
             inverse_ops.appendAssumeCapacity(inv);
 
-            switch (prep.op) {
-                .delete => |del| {
-                    if (try self.captureDeletionMeta(del.start, del.end, inv)) |meta| {
-                        errdefer {
-                            var owned = meta;
-                            owned.deinit(self.allocator);
-                        }
-                        try deletion_metas.append(self.allocator, meta);
-                    }
-                },
-                .replace => |rep| {
-                    if (try self.captureDeletionMeta(rep.start, rep.end, inv)) |meta| {
-                        errdefer {
-                            var owned = meta;
-                            owned.deinit(self.allocator);
-                        }
-                        try deletion_metas.append(self.allocator, meta);
-                    }
-                },
-                else => {},
+            if (try self.captureDeletionMeta(edit.start, edit.end, splice.start, inv)) |meta| {
+                errdefer {
+                    var owned = meta;
+                    owned.deinit(self.allocator);
+                }
+                try deletion_metas.append(self.allocator, meta);
             }
 
-            try self.applyOne(prep);
-
-            switch (prep.op) {
-                .insert => |ins| {
-                    try self.rebaseAnchorsForInsert(ins.pos, prep.inserted_graphemes);
-                    affected_ranges.appendAssumeCapacity(.{ .start = ins.pos, .end = ins.pos + prep.inserted_graphemes });
-                },
-                .delete => |del| {
-                    try self.rebaseAnchorsForDelete(del.start, del.end);
-                    affected_ranges.appendAssumeCapacity(.{ .start = del.start, .end = del.start });
-                },
-                .replace => |rep| {
-                    try self.rebaseAnchorsForDelete(rep.start, rep.end);
-                    try self.rebaseAnchorsForInsert(rep.start, prep.inserted_graphemes);
-                    affected_ranges.appendAssumeCapacity(.{ .start = rep.start, .end = rep.start + prep.inserted_graphemes });
-                },
-            }
+            try self.table.applySplice(splice, edit.text);
+            try self.rebaseAnchorsForSplice(splice, edit.text, restoredText(inv));
+            affected_ranges.appendAssumeCapacity(.{ .start = splice.start, .end = splice.new_end });
         }
 
         const old_revision = self.revision;
