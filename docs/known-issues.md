@@ -6,17 +6,20 @@ The v0.1 specification is authoritative but remains a draft. These implementatio
 
 `BufferEngine.initFromText` lacks cleanup after creating the engine if text initialization or path copying fails. `PieceTable.initFromText` destroys the old tree before allocating its replacement. Constructors and reinitialization need allocation-failure tests and defined cleanup/recovery before callers can rely on failure preserving a valid prior value.
 
-`submit` validates before mutation but does not provide rollback for all allocation failures. Operations can edit text and rebase anchors before later allocations for events, history or interaction state fail. In particular, replacement deletes before insertion. This falls short of the draft atomicity contract; successful preflight alone does not establish transactional failure safety.
+Buffer operations are applied provisionally and committed only after the whole payload, and for composites its interaction positions, validate against the realized text. Rejections roll back through the recorded inverses and an anchor snapshot. Everything that can fail after the commit (the history slot, the provider notification set, anchors for marks) is reserved before it, and transient allocation failures anywhere in a composite are covered by an injection test. Allocation failure is still not fully transactional:
+
+- `PieceTable.applySplice` prepares the add buffer and pieces before removing the old range, but inserting pieces into the tree allocates afterwards. A failure there loses the old range. Tree insertion needs to reserve node capacity, including splits, before it mutates; the skipped undo/redo injection test in `tests/transaction_test.zig` checks that fix.
+- Rollback replays inverses through the piece table, which allocates. Under persistent exhaustion it logs and leaves the document inconsistent.
+
+An intent without a document origin is treated as computed at head. Litura therefore checks position-bearing interaction requests against their document origin only when one is supplied.
 
 Undo/redo error recovery discards allocation failures while restoring history entries. Provider destruction also allocates a temporary identity set and discards insertion failures, risking repeated destruction of shared provider state under memory pressure. Tree rebalancing has `catch unreachable` on list operations without a documented local capacity proof; that capacity invariant needs verification. These error paths require correctness work, not replacement with different unchecked failure handling during a style pass.
-
-Multi-operation validation estimates each operation's grapheme delta from the inserted text alone. Edits apply exactly, but an edit can merge neighbouring graphemes (`e` + U+0301), so the estimate is an upper bound: a later operation in the same payload may pass validation and then fail with `OutOfRange` after earlier operations were applied. Single-operation payloads are validated exactly.
 
 zg 0.16.2's `Graphemes.Iterator` sums cluster length in a `u8`, so a grapheme longer than 255 bytes panics in safe builds and is mismeasured otherwise. `text_segmentation.Iterator` drives zg's `graphemeBreak` with a full-width length instead; remove it once upstream is fixed.
 
 ## Interaction and provider revisions
 
-`moveAnchor` checks only that an anchor exists. It accepts out-of-bounds positions and does not increment session interaction revisions. Higher-level interaction intents validate positions and advance revisions. The direct path remains observable and is characterized by a test; changing it requires deciding which pathway is authoritative.
+`moveAnchor` checks only that an anchor exists. It accepts out-of-bounds positions and does not increment session interaction revisions, although moving a session cursor explicitly is an interaction mutation (SPEC §2.6). Higher-level interaction intents validate positions and advance revisions. The direct path remains observable and is characterized by a test; changing it requires deciding which pathway is authoritative.
 
 `StaticTokenProvider.refresh` increments its local revision once, even if the document has advanced several revisions. It can report an available state at a different revision from the document. The provider borrows its input spans and never reparses or rebases them. A characterization test preserves visibility of the revision mismatch; it is not an endorsement of that contract.
 

@@ -80,14 +80,85 @@ pub const BufferEngine = struct {
         text: []const u8,
     };
 
-    fn requestedEdit(op: types.BufferOp) RequestedEdit {
-        return switch (op) {
-            .insert => |ins| .{ .start = ins.pos, .end = ins.pos, .text = ins.text },
-            .delete => |del| .{ .start = del.start, .end = del.end, .text = "" },
-            .replace => |rep| .{ .start = rep.start, .end = rep.end, .text = rep.text },
-        };
-    }
+    /// Buffer and interaction parts of a Composite, in order. Borrows the intent's payloads.
+    const CompositeParts = struct {
+        buffer_ops: std.ArrayListUnmanaged(types.BufferOp) = .empty,
+        interactions: std.ArrayListUnmanaged(types.InteractionMutation) = .empty,
+        has_edit_refs: bool = false,
 
+        fn deinit(self: *CompositeParts, allocator: std.mem.Allocator) void {
+            self.buffer_ops.deinit(allocator);
+            self.interactions.deinit(allocator);
+            self.* = undefined;
+        }
+    };
+
+    /// Anchors carrying a buffer operation's realized result through later operations.
+    const EditAnchors = struct {
+        start: anchors.AnchorId,
+        end: anchors.AnchorId,
+    };
+
+    /// Byte offsets of grapheme boundaries in a splice's old and new region text.
+    const SpliceBoundaries = struct {
+        old: []u32,
+        new: []u32,
+
+        fn init(
+            engine: *const BufferEngine,
+            splice: Splice,
+            inserted: []const u8,
+            old_text: []const u8,
+        ) !SpliceBoundaries {
+            const new_text = try std.mem.concat(engine.allocator, u8, &.{
+                old_text[0..splice.left_context_bytes],
+                inserted,
+                old_text[old_text.len - splice.right_context_bytes ..],
+            });
+            defer engine.allocator.free(new_text);
+            const old = try engine.table.seg.graphemeToByteMap(engine.allocator, old_text);
+            errdefer engine.allocator.free(old);
+            return .{
+                .old = old,
+                .new = try engine.table.seg.graphemeToByteMap(engine.allocator, new_text),
+            };
+        }
+
+        fn deinit(self: *SpliceBoundaries, allocator: std.mem.Allocator) void {
+            allocator.free(self.old);
+            allocator.free(self.new);
+            self.* = undefined;
+        }
+    };
+
+    /// Buffer operations applied to the text but not yet committed as a revision.
+    /// Grapheme deltas are not additive (SPEC §1.4), so a payload is validated exactly by
+    /// applying it; a rejection rolls the applied prefix back before anything is observable.
+    const PendingMutation = struct {
+        anchors_before: std.AutoHashMapUnmanaged(u32, anchors.Anchor),
+        inverse_ops: std.ArrayListUnmanaged(types.BufferOp) = .empty,
+        affected_ranges: std.ArrayListUnmanaged(types.Range) = .empty,
+        deletion_metas: std.ArrayListUnmanaged(types.DeletionMeta) = .empty,
+
+        fn deinit(self: *PendingMutation, allocator: std.mem.Allocator) void {
+            self.anchors_before.deinit(allocator);
+            for (self.inverse_ops.items) |op| freeOpText(allocator, op);
+            self.inverse_ops.deinit(allocator);
+            self.affected_ranges.deinit(allocator);
+            for (self.deletion_metas.items) |*meta| meta.deinit(allocator);
+            self.deletion_metas.deinit(allocator);
+            self.* = undefined;
+        }
+    };
+
+    const PendingResult = union(enum) {
+        applied: PendingMutation,
+        /// Owned message; nothing was applied.
+        rejected: []u8,
+    };
+
+    /// Validates and applies each operation against the text produced by the previous
+    /// ones. On rejection or error, the applied prefix is rolled back.
     /// Creates an empty owning engine. Release it with deinit.
     pub fn init(allocator: std.mem.Allocator) !BufferEngine {
         return .{
@@ -301,6 +372,11 @@ pub const BufferEngine = struct {
             switch (op) {
                 .move_cursor_anchor => |move| try self.moveAnchor(move.cursor, move.position),
                 .set_cursor_selection => |selection| try self.setSessionMarkPositionNoRevision(payload.session_id, selection.cursor, selection.mark_position),
+                .place_cursor => |place| {
+                    try self.moveAnchor(place.cursor, try concretePosition(place.at));
+                    const mark = if (place.mark) |target| try concretePosition(target) else null;
+                    try self.setSessionMarkPositionNoRevision(payload.session_id, place.cursor, mark);
+                },
             }
         }
 
@@ -312,23 +388,33 @@ pub const BufferEngine = struct {
         };
     }
 
-    fn notifyViewProviders(self: *BufferEngine, event: *const types.EditEvent) !void {
-        var seen = std.AutoHashMap(usize, void).init(self.allocator);
-        defer seen.deinit();
-        try seen.ensureTotalCapacity(self.view_providers.count());
+    /// Edit references must have been resolved by the enclosing composite.
+    fn concretePosition(target: types.InteractionTarget) !u32 {
+        return switch (target) {
+            .position => |position| position,
+            .edit => error.InvalidArgument,
+        };
+    }
 
+    /// Notifies each distinct provider once. `seen` must be empty with capacity for every
+    /// registered provider, so notification cannot fail after a revision is committed.
+    fn notifyViewProviders(
+        self: *BufferEngine,
+        event: *const types.EditEvent,
+        seen: *std.AutoHashMapUnmanaged(usize, void),
+    ) void {
         var iter = self.view_providers.valueIterator();
         while (iter.next()) |provider| {
             const identity = @intFromPtr(provider.ptr);
             if (seen.contains(identity)) continue;
-            try seen.put(identity, {});
+            seen.putAssumeCapacity(identity, {});
             provider.onBufferEvent(@ptrCast(self), @ptrCast(@constCast(event)));
         }
     }
 
     /// Validates origins and guards, then applies the intent synchronously.
-    /// Rejections are owning validation reports. Allocation errors can leave partial
-    /// progress; this differs from the draft atomicity contract (docs/known-issues.md).
+    /// Rejections are owning validation reports and leave no observable effect. Some
+    /// allocation failures are not fully transactional (docs/known-issues.md).
     pub fn submit(self: *BufferEngine, intent: types.Intent) !types.SubmitResult {
         switch (intent.payload) {
             .buffer_mutation => |payload| {
@@ -338,20 +424,29 @@ pub const BufferEngine = struct {
                 if (try validation.validationReportForGuards(self, intent)) |report| {
                     return .{ .validation_report = report };
                 }
-                if (try validation.validateBufferOpsAgainstLength(self, payload.ops, self.table.graphemeCount())) |message| {
-                    defer self.allocator.free(message);
-                    return .{ .validation_report = try validation.validationReport(self, intent, .invalid, message, try self.allocator.alloc(types.GuardEval, 0)) };
-                }
-                var commit = try self.applyOpsInternal(payload.ops, intent.source, intent.cause);
-                errdefer commit.deinit(self.allocator);
-                try self.undo_stack.append(self.allocator, commit.undo_entry);
-                for (self.redo_stack.items) |*entry| entry.deinit(self.allocator);
-                self.redo_stack.clearRetainingCapacity();
-                return .{ .edit_event = commit.event };
+                var pending = switch (try self.applyOpsPending(payload.ops, null)) {
+                    .applied => |applied| applied,
+                    .rejected => |message| return self.invalidReport(intent, message),
+                };
+                const event = try self.finishCommit(
+                    &pending,
+                    payload.ops,
+                    intent.source,
+                    intent.cause,
+                    &self.undo_stack,
+                );
+                self.discardRedo();
+                return .{ .edit_event = event };
             },
             .interaction_mutation => |payload| {
                 if (try validation.validationReportForStaleInteractionOrigin(self, intent, payload)) |report| {
                     return .{ .validation_report = report };
+                }
+                // Positions are document coordinates: they need a current document origin.
+                if (validation.interactionHasPositions(payload)) {
+                    if (try validation.validationReportForStaleBufferOrigin(self, intent)) |report| {
+                        return .{ .validation_report = report };
+                    }
                 }
                 if (try validation.validationReportForGuards(self, intent)) |report| {
                     return .{ .validation_report = report };
@@ -374,14 +469,18 @@ pub const BufferEngine = struct {
                     return .{ .validation_report = try validation.validationReport(self, intent, .invalid, "nothing to undo", try self.allocator.alloc(types.GuardEval, 0)) };
                 }
 
+                // Popping keeps the capacity that restoring the entry on failure needs.
                 var original = self.undo_stack.pop().?;
-                errdefer self.undo_stack.append(self.allocator, original) catch {};
-                var commit = try self.applyOpsInternal(original.inverse_ops, intent.source, intent.cause);
-                errdefer commit.deinit(self.allocator);
+                errdefer self.undo_stack.appendAssumeCapacity(original);
+                const event = try self.applyOpsCommitted(
+                    original.inverse_ops,
+                    intent.source,
+                    intent.cause,
+                    &self.redo_stack,
+                );
                 try self.resurrectDeletionMetas(original.deletion_metas);
-                try self.redo_stack.append(self.allocator, commit.undo_entry);
                 original.deinit(self.allocator);
-                return .{ .edit_event = commit.event };
+                return .{ .edit_event = event };
             },
             .redo => {
                 if (try validation.validationReportForStaleBufferOrigin(self, intent)) |report| {
@@ -394,14 +493,18 @@ pub const BufferEngine = struct {
                     return .{ .validation_report = try validation.validationReport(self, intent, .invalid, "nothing to redo", try self.allocator.alloc(types.GuardEval, 0)) };
                 }
 
+                // Popping keeps the capacity that restoring the entry on failure needs.
                 var original = self.redo_stack.pop().?;
-                errdefer self.redo_stack.append(self.allocator, original) catch {};
-                var commit = try self.applyOpsInternal(original.inverse_ops, intent.source, intent.cause);
-                errdefer commit.deinit(self.allocator);
+                errdefer self.redo_stack.appendAssumeCapacity(original);
+                const event = try self.applyOpsCommitted(
+                    original.inverse_ops,
+                    intent.source,
+                    intent.cause,
+                    &self.undo_stack,
+                );
                 try self.resurrectDeletionMetas(original.deletion_metas);
-                try self.undo_stack.append(self.allocator, commit.undo_entry);
                 original.deinit(self.allocator);
-                return .{ .edit_event = commit.event };
+                return .{ .edit_event = event };
             },
         }
     }
@@ -420,67 +523,255 @@ pub const BufferEngine = struct {
 
         const flat_parts = try validation.flattenCompositeParts(self.allocator, payload.parts);
         defer self.allocator.free(flat_parts);
-        if (flat_parts.len == 0) {
-            return .{ .validation_report = try validation.validationReport(self, intent, .invalid, "composite intent requires at least one payload", try self.allocator.alloc(types.GuardEval, 0)) };
+        var parts: CompositeParts = .{};
+        defer parts.deinit(self.allocator);
+        if (try self.collectCompositeParts(intent, flat_parts, &parts)) |rejection| return rejection;
+        const buffer_ops = parts.buffer_ops.items;
+
+        // Buffer operations are applied provisionally: interaction positions address the
+        // text they produce, whose grapheme count cannot be predicted from requested text.
+        var pending: ?PendingMutation = null;
+        errdefer if (pending) |*applied| self.rollbackPending(applied);
+        const edit_anchors: ?[]EditAnchors = if (parts.has_edit_refs)
+            try self.allocator.alloc(EditAnchors, buffer_ops.len)
+        else
+            null;
+        defer if (edit_anchors) |slice| self.allocator.free(slice);
+        if (buffer_ops.len > 0) {
+            pending = switch (try self.applyOpsPending(buffer_ops, edit_anchors)) {
+                .applied => |applied| applied,
+                .rejected => |message| return self.invalidReport(intent, message),
+            };
         }
 
-        var combined_ops = std.ArrayListUnmanaged(types.BufferOp).empty;
-        defer combined_ops.deinit(self.allocator);
-        var interaction_payloads = std.ArrayListUnmanaged(types.InteractionMutation).empty;
-        defer interaction_payloads.deinit(self.allocator);
-        var working_length = self.table.graphemeCount();
-        var seen_interaction = false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const prepared = try self.prepareCompositeInteractions(
+            arena.allocator(),
+            parts.interactions.items,
+            edit_anchors,
+        );
+        const resolved = switch (prepared) {
+            .resolved => |resolved| resolved,
+            .rejected => |message| {
+                if (pending) |*applied| self.rollbackPending(applied);
+                pending = null;
+                return self.invalidReport(intent, message);
+            },
+        };
 
+        // Applying the interactions must not fail after the commit: reserve their anchors.
+        try self.anchors_map.ensureUnusedCapacity(self.allocator, markCount(resolved));
+        var event: ?types.EditEvent = null;
+        if (pending) |applied| {
+            var owned = applied;
+            pending = null;
+            event = try self.finishCommit(
+                &owned,
+                buffer_ops,
+                intent.source,
+                intent.cause,
+                &self.undo_stack,
+            );
+            self.discardRedo();
+        }
+
+        var interaction_result: ?types.InteractionResult = null;
+        for (resolved) |interaction| {
+            interaction_result = try self.applyInteractionMutation(interaction);
+        }
+
+        if (event) |edit_event| return .{ .edit_event = edit_event };
+        return .{ .interaction_result = interaction_result.? };
+    }
+
+    /// Checks structure, interaction CAS and edit reference indices against the
+    /// pre-application snapshot, collecting the parts. Returns a rejection report, if any.
+    fn collectCompositeParts(
+        self: *BufferEngine,
+        intent: types.Intent,
+        flat_parts: []const types.IntentPayload,
+        parts: *CompositeParts,
+    ) !?types.SubmitResult {
+        var seen_interaction = false;
         for (flat_parts) |part| {
             switch (part) {
                 .buffer_mutation => |buffer| {
                     if (seen_interaction) {
-                        return .{ .validation_report = try validation.validationReport(self, intent, .invalid, "buffer mutations must precede interaction mutations in a composite", try self.allocator.alloc(types.GuardEval, 0)) };
+                        return try self.invalidMessage(
+                            intent,
+                            "buffer mutations must precede interaction mutations in a composite",
+                        );
                     }
-                    if (try validation.validateBufferOpsIntoLength(self, buffer.ops, &working_length)) |message| {
-                        defer self.allocator.free(message);
-                        return .{ .validation_report = try validation.validationReport(self, intent, .invalid, message, try self.allocator.alloc(types.GuardEval, 0)) };
+                    if (buffer.ops.len == 0) {
+                        return try self.invalidMessage(intent, "apply requires at least one operation");
                     }
-                    try combined_ops.appendSlice(self.allocator, buffer.ops);
+                    try parts.buffer_ops.appendSlice(self.allocator, buffer.ops);
                 },
                 .interaction_mutation => |interaction| {
                     seen_interaction = true;
                     if (try validation.validationReportForStaleInteractionOrigin(self, intent, interaction)) |report| {
                         return .{ .validation_report = report };
                     }
-                    if (try validation.validateInteractionMutation(self, interaction, working_length)) |message| {
-                        defer self.allocator.free(message);
-                        return .{ .validation_report = try validation.validationReport(self, intent, .invalid, message, try self.allocator.alloc(types.GuardEval, 0)) };
-                    }
-                    try interaction_payloads.append(self.allocator, interaction);
+                    try parts.interactions.append(self.allocator, interaction);
                 },
                 else => {
-                    return .{ .validation_report = try validation.validationReport(self, intent, .invalid, "composite only supports buffer and interaction mutations", try self.allocator.alloc(types.GuardEval, 0)) };
+                    return try self.invalidMessage(
+                        intent,
+                        "composite only supports buffer and interaction mutations",
+                    );
                 },
             }
         }
 
-        if (combined_ops.items.len == 0 and interaction_payloads.items.len == 0) {
-            return .{ .validation_report = try validation.validationReport(self, intent, .invalid, "composite intent requires at least one payload", try self.allocator.alloc(types.GuardEval, 0)) };
+        if (parts.buffer_ops.items.len == 0 and parts.interactions.items.len == 0) {
+            return try self.invalidMessage(intent, "composite intent requires at least one payload");
         }
-
-        var event: ?types.EditEvent = null;
-        if (combined_ops.items.len > 0) {
-            var commit = try self.applyOpsInternal(combined_ops.items, intent.source, intent.cause);
-            errdefer commit.deinit(self.allocator);
-            try self.undo_stack.append(self.allocator, commit.undo_entry);
-            for (self.redo_stack.items) |*entry| entry.deinit(self.allocator);
-            self.redo_stack.clearRetainingCapacity();
-            event = commit.event;
+        for (parts.interactions.items) |interaction| {
+            if (!validation.interactionHasEditRefs(interaction)) continue;
+            parts.has_edit_refs = true;
+            if (editRefOutOfRange(interaction, parts.buffer_ops.items.len)) |op| {
+                return try self.invalidReport(
+                    intent,
+                    try std.fmt.allocPrint(
+                        self.allocator,
+                        "edit reference to buffer operation {d} is out of range",
+                        .{op},
+                    ),
+                );
+            }
         }
+        return null;
+    }
 
-        var interaction_result: ?types.InteractionResult = null;
-        for (interaction_payloads.items) |interaction| {
-            interaction_result = try self.applyInteractionMutation(interaction);
+    /// Resolves edit references to positions, drops their result anchors and validates
+    /// every interaction against the text the buffer operations produced. The resolved
+    /// payloads live in arena; a rejection message is owned by the caller.
+    fn prepareCompositeInteractions(
+        self: *BufferEngine,
+        arena: std.mem.Allocator,
+        interactions: []const types.InteractionMutation,
+        edit_anchors: ?[]const EditAnchors,
+    ) !union(enum) { resolved: []const types.InteractionMutation, rejected: []u8 } {
+        const resolved = try arena.dupe(types.InteractionMutation, interactions);
+        if (edit_anchors) |by_op| {
+            const unresolved = self.resolveEditRefs(arena, resolved, by_op);
+            for (by_op) |edit| {
+                try self.dropAnchor(edit.start);
+                try self.dropAnchor(edit.end);
+            }
+            if (try unresolved) |op| {
+                return .{
+                    .rejected = try std.fmt.allocPrint(
+                        self.allocator,
+                        "edit reference to buffer operation {d} was deleted by a later operation",
+                        .{op},
+                    ),
+                };
+            }
         }
+        for (resolved) |interaction| {
+            const length = self.table.graphemeCount();
+            if (try validation.validateInteractionMutation(self, interaction, length)) |message| {
+                return .{ .rejected = message };
+            }
+        }
+        return .{ .resolved = resolved };
+    }
 
-        if (event) |edit_event| return .{ .edit_event = edit_event };
-        return .{ .interaction_result = interaction_result.? };
+    fn editRefOutOfRange(payload: types.InteractionMutation, op_count: usize) ?u32 {
+        for (payload.ops) |op| switch (op) {
+            .place_cursor => |place| {
+                const targets = [_]?types.InteractionTarget{ place.at, place.mark };
+                for (targets) |maybe_target| {
+                    const target = maybe_target orelse continue;
+                    if (target == .edit and target.edit.op >= op_count) return target.edit.op;
+                }
+            },
+            else => {},
+        };
+        return null;
+    }
+
+    /// Replaces edit references with the current positions of their result anchors.
+    /// Returns the referenced operation whose Weak start anchor died, if any.
+    fn resolveEditRefs(
+        self: *const BufferEngine,
+        arena: std.mem.Allocator,
+        payloads: []types.InteractionMutation,
+        by_op: []const EditAnchors,
+    ) !?u32 {
+        for (payloads) |*payload| {
+            if (!validation.interactionHasEditRefs(payload.*)) continue;
+            const ops = try arena.dupe(types.InteractionOp, payload.ops);
+            for (ops) |*op| switch (op.*) {
+                .place_cursor => |*place| {
+                    place.at = (try self.resolveTarget(place.at, by_op)) orelse return place.at.edit.op;
+                    if (place.mark) |mark| {
+                        place.mark = (try self.resolveTarget(mark, by_op)) orelse return mark.edit.op;
+                    }
+                },
+                else => {},
+            };
+            payload.ops = ops;
+        }
+        return null;
+    }
+
+    fn resolveTarget(
+        self: *const BufferEngine,
+        target: types.InteractionTarget,
+        by_op: []const EditAnchors,
+    ) !?types.InteractionTarget {
+        const ref = switch (target) {
+            .position => return target,
+            .edit => |ref| ref,
+        };
+        const edit = by_op[ref.op];
+        const info = try self.queryAnchor(if (ref.edge == .start) edit.start else edit.end);
+        return .{ .position = info.position orelse return null };
+    }
+
+    /// Reports a borrowed message; the report owns a copy.
+    fn invalidMessage(
+        self: *BufferEngine,
+        intent: types.Intent,
+        message: []const u8,
+    ) !types.SubmitResult {
+        return self.invalidReport(intent, try self.allocator.dupe(u8, message));
+    }
+
+    /// Takes ownership of message.
+    fn invalidReport(self: *BufferEngine, intent: types.Intent, message: []u8) !types.SubmitResult {
+        defer self.allocator.free(message);
+        return .{
+            .validation_report = try validation.validationReport(
+                self,
+                intent,
+                .invalid,
+                message,
+                try self.allocator.alloc(types.GuardEval, 0),
+            ),
+        };
+    }
+
+    /// A new edit makes the redo branch unreachable (SPEC §2.5.6).
+    fn discardRedo(self: *BufferEngine) void {
+        for (self.redo_stack.items) |*entry| entry.deinit(self.allocator);
+        self.redo_stack.clearRetainingCapacity();
+    }
+
+    /// Upper bound on the mark anchors that applying these interactions creates.
+    fn markCount(interactions: []const types.InteractionMutation) u32 {
+        var count: u32 = 0;
+        for (interactions) |interaction| for (interaction.ops) |op| switch (op) {
+            .move_cursor_anchor => {},
+            .set_cursor_selection => |selection| count += @intFromBool(
+                selection.mark_position != null,
+            ),
+            .place_cursor => |place| count += @intFromBool(place.mark != null),
+        };
+        return count;
     }
 
     fn validateLiveAnchor(self: *const BufferEngine, anchor_id: anchors.AnchorId) !void {
@@ -705,70 +996,51 @@ pub const BufferEngine = struct {
         return count;
     }
 
+    fn requestedEdit(op: types.BufferOp) RequestedEdit {
+        return switch (op) {
+            .insert => |ins| .{ .start = ins.pos, .end = ins.pos, .text = ins.text },
+            .delete => |del| .{ .start = del.start, .end = del.end, .text = "" },
+            .replace => |rep| .{ .start = rep.start, .end = rep.end, .text = rep.text },
+        };
+    }
+
     /// Takes ownership of old_text, the exact text of the splice's old range.
     fn inverseForSplice(self: *const BufferEngine, splice: Splice, old_text: []u8) types.BufferOp {
         if (old_text.len == 0) {
             self.allocator.free(old_text);
             return .{ .delete = .{ .start = splice.start, .end = splice.new_end } };
         }
-        if (splice.new_end == splice.start) return .{ .insert = .{ .pos = splice.start, .text = old_text } };
+        if (splice.new_end == splice.start) return .{
+            .insert = .{ .pos = splice.start, .text = old_text },
+        };
         return .{ .replace = .{ .start = splice.start, .end = splice.new_end, .text = old_text } };
     }
-
-    /// Byte offsets of grapheme boundaries in a splice's old and new region text.
-    const SpliceBoundaries = struct {
-        old: []u32,
-        new: []u32,
-
-        fn init(
-            engine: *const BufferEngine,
-            splice: Splice,
-            inserted: []const u8,
-            old_text: []const u8,
-        ) !SpliceBoundaries {
-            const new_text = try std.mem.concat(engine.allocator, u8, &.{
-                old_text[0..splice.left_context_bytes],
-                inserted,
-                old_text[old_text.len - splice.right_context_bytes ..],
-            });
-            defer engine.allocator.free(new_text);
-            const old = try engine.table.seg.graphemeToByteMap(engine.allocator, old_text);
-            errdefer engine.allocator.free(old);
-            return .{ .old = old, .new = try engine.table.seg.graphemeToByteMap(engine.allocator, new_text) };
-        }
-
-        fn deinit(self: *SpliceBoundaries, allocator: std.mem.Allocator) void {
-            allocator.free(self.old);
-            allocator.free(self.new);
-            self.* = undefined;
-        }
-    };
 
     /// SPEC §1.4 replacement rebasing over byte offsets, so it stays additive when
     /// grapheme counts are not. Null means the anchor dies.
     fn rebaseByte(
-        x: u32,
+        offset: u32,
         deleted_start: u32,
         deleted_end: u32,
         inserted_len: u32,
         stickiness: anchors.AnchorStickiness,
     ) ?u32 {
-        if (x < deleted_start) return x;
-        if (x > deleted_end) return x - (deleted_end - deleted_start) + inserted_len;
+        if (offset < deleted_start) return offset;
+        if (offset > deleted_end) return offset - (deleted_end - deleted_start) + inserted_len;
         if (stickiness == .sticky) return deleted_start + inserted_len;
-        if (x > deleted_start and x < deleted_end) return null;
+        if (offset > deleted_start and offset < deleted_end) return null;
         return deleted_start;
     }
 
     /// Projects a byte offset to a grapheme boundary index: weak rounds down, sticky up.
-    fn projectToBoundary(bounds: []const u32, x: u32, stickiness: anchors.AnchorStickiness) u32 {
+    fn projectToBoundary(bounds: []const u32, offset: u32, stickiness: anchors.AnchorStickiness) u32 {
         var lo: usize = 0;
         var hi: usize = bounds.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (bounds[mid] < x) lo = mid + 1 else hi = mid;
+            if (bounds[mid] < offset) lo = mid + 1 else hi = mid;
         }
-        if (lo < bounds.len and bounds[lo] == x) return @intCast(lo);
+        if (lo < bounds.len and bounds[lo] == offset) return @intCast(lo);
         return @intCast(if (stickiness == .sticky) lo else lo - 1);
     }
 
@@ -798,7 +1070,8 @@ pub const BufferEngine = struct {
     }
 
     /// Rebases anchors across one realized splice. Resegmentation never kills an anchor;
-    /// only weak anchors strictly inside the requested deletion die.
+    /// only weak anchors strictly inside the requested deletion die. Passive rebasing does
+    /// not advance interaction revisions; the edit event is its notification (SPEC §2.6).
     fn rebaseAnchorsForSplice(
         self: *BufferEngine,
         splice: Splice,
@@ -808,10 +1081,6 @@ pub const BufferEngine = struct {
         // Built on first use: long resegmentations rarely contain anchors.
         var boundaries: ?SpliceBoundaries = null;
         defer if (boundaries) |*b| b.deinit(self.allocator);
-
-        var bumped_sessions = std.AutoHashMap(u32, void).init(self.allocator);
-        defer bumped_sessions.deinit();
-        try bumped_sessions.ensureTotalCapacity(self.sessions.count());
 
         var iter = self.anchors_map.valueIterator();
         while (iter.next()) |anchor| {
@@ -824,34 +1093,18 @@ pub const BufferEngine = struct {
                 if (boundaries == null and !splice.isAligned()) {
                     boundaries = try SpliceBoundaries.init(self, splice, inserted, old_text);
                 }
-                break :blk spliceRegionPosition(splice, boundaries, inserted.len, anchor.position, anchor.stickiness);
+                break :blk spliceRegionPosition(
+                    splice,
+                    boundaries,
+                    inserted.len,
+                    anchor.position,
+                    anchor.stickiness,
+                );
             };
             if (next) |position| {
-                if (position == anchor.position) continue;
                 anchor.position = position;
             } else {
                 anchor.status = .dead;
-            }
-            try self.bumpSessionsForAnchorId(anchor.id, &bumped_sessions);
-        }
-    }
-
-    fn bumpSessionsForAnchorId(self: *BufferEngine, anchor_id: anchors.AnchorId, bumped_sessions: *std.AutoHashMap(u32, void)) !void {
-        var sess_iter = self.sessions.valueIterator();
-        while (sess_iter.next()) |sess| {
-            if (bumped_sessions.contains(sess.id)) continue;
-            var belongs = false;
-            for (sess.interaction.cursors.items) |cursor| {
-                if (cursor.anchor.value == anchor_id.value or
-                    (cursor.mark != null and cursor.mark.?.value == anchor_id.value))
-                {
-                    belongs = true;
-                    break;
-                }
-            }
-            if (belongs) {
-                sess.interaction.revision += 1;
-                bumped_sessions.putAssumeCapacity(sess.id, {});
             }
         }
     }
@@ -877,10 +1130,7 @@ pub const BufferEngine = struct {
         if (start == end) return null;
 
         var dead_anchors = std.ArrayListUnmanaged(types.DeadAnchorRecord).empty;
-        errdefer {
-            if (dead_anchors.items.len > 0) self.allocator.free(dead_anchors.items);
-            dead_anchors = .empty;
-        }
+        errdefer dead_anchors.deinit(self.allocator);
 
         var iter = self.anchors_map.valueIterator();
         while (iter.next()) |anchor| {
@@ -916,10 +1166,6 @@ pub const BufferEngine = struct {
     ) !void {
         if (deletion_metas.len == 0) return;
 
-        var bumped_sessions = std.AutoHashMap(u32, void).init(self.allocator);
-        defer bumped_sessions.deinit();
-        try bumped_sessions.ensureTotalCapacity(self.sessions.count());
-
         for (deletion_metas) |meta| {
             const target_anchor = self.anchors_map.get(meta.target_anchor.value) orelse return error.KeyError;
             if (target_anchor.status == .dead) return error.KeyError;
@@ -930,24 +1176,23 @@ pub const BufferEngine = struct {
                 anchor.position = target_position + record.offset;
                 anchor.stickiness = record.stickiness;
                 anchor.status = .live;
-                try self.bumpSessionsForAnchorId(record.anchor, &bumped_sessions);
             }
 
             try self.dropAnchor(meta.target_anchor);
         }
     }
 
+    /// Applies operations directly, without origin or guard validation, and records undo.
+    /// A rejected operation rolls back the whole payload and returns error.InvalidArgument.
     pub fn applyOps(
         self: *BufferEngine,
         ops: []const types.BufferOp,
         source: []const u8,
         cause: []const u8,
     ) !void {
-        var commit = try self.applyOpsInternal(ops, source, cause);
-        defer commit.event.deinit(self.allocator);
-        try self.undo_stack.append(self.allocator, commit.undo_entry);
-        for (self.redo_stack.items) |*entry| entry.deinit(self.allocator);
-        self.redo_stack.clearRetainingCapacity();
+        var event = try self.applyOpsCommitted(ops, source, cause, &self.undo_stack);
+        event.deinit(self.allocator);
+        self.discardRedo();
     }
 
     fn editClass(ops: []const types.BufferOp) []const u8 {
@@ -963,91 +1208,231 @@ pub const BufferEngine = struct {
         };
     }
 
-    fn applyOpsInternal(
+    fn freeOpText(allocator: std.mem.Allocator, op: types.BufferOp) void {
+        switch (op) {
+            .insert => |ins| allocator.free(ins.text),
+            .replace => |rep| allocator.free(rep.text),
+            .delete => {},
+        }
+    }
+
+    /// When `edits` is supplied, the result anchors of every operation are recorded in it.
+    fn applyOpsPending(
         self: *BufferEngine,
+        ops: []const types.BufferOp,
+        edits: ?[]EditAnchors,
+    ) !PendingResult {
+        if (ops.len == 0) return .{
+            .rejected = try self.allocator.dupe(u8, "apply requires at least one operation"),
+        };
+        var pending: PendingMutation = .{
+            .anchors_before = try self.anchors_map.clone(self.allocator),
+        };
+        errdefer self.rollbackPending(&pending);
+        for (ops, 0..) |op, index| {
+            const result_anchors = if (edits) |slice| &slice[index] else null;
+            if (try self.applyPendingOp(&pending, op, result_anchors)) |message| {
+                self.rollbackPending(&pending);
+                return .{ .rejected = message };
+            }
+        }
+        return .{ .applied = pending };
+    }
+
+    fn applyPendingOp(
+        self: *BufferEngine,
+        pending: *PendingMutation,
+        op: types.BufferOp,
+        edit_anchors: ?*EditAnchors,
+    ) !?[]u8 {
+        if (try validation.bufferOpMessage(self, op)) |message| return message;
+        try pending.inverse_ops.ensureUnusedCapacity(self.allocator, 1);
+        try pending.affected_ranges.ensureUnusedCapacity(self.allocator, 1);
+
+        const edit = requestedEdit(op);
+        const splice = try self.table.planReplace(edit.start, edit.end, edit.text);
+        const inverse = self.inverseForSplice(
+            splice,
+            try self.table.getTextRange(splice.start, splice.old_end),
+        );
+        var inverse_owned = true;
+        defer if (inverse_owned) freeOpText(self.allocator, inverse);
+
+        // The hidden target anchor joins the anchor map; the snapshot removes it on rollback.
+        if (try self.captureDeletionMeta(edit.start, edit.end, splice.start, inverse)) |meta| {
+            errdefer {
+                var owned = meta;
+                owned.deinit(self.allocator);
+            }
+            try pending.deletion_metas.append(self.allocator, meta);
+        }
+
+        try self.table.applySplice(splice, edit.text);
+        pending.inverse_ops.appendAssumeCapacity(inverse);
+        inverse_owned = false;
+        pending.affected_ranges.appendAssumeCapacity(
+            .{ .start = splice.start, .end = splice.new_end },
+        );
+        try self.rebaseAnchorsForSplice(splice, edit.text, restoredText(inverse));
+        if (edit_anchors) |result| {
+            // Created after this operation's own rebasing, so only later operations move them.
+            const edges = try self.insertedEdges(splice, edit.text, restoredText(inverse));
+            result.* = .{
+                .start = try self.createAnchor(edges.start, .weak),
+                .end = try self.createAnchor(edges.end, .sticky),
+            };
+        }
+        return null;
+    }
+
+    /// The start (Weak) and end (Sticky) of an operation's inserted text, projected onto
+    /// the boundaries that operation produced (SPEC §1.4).
+    fn insertedEdges(
+        self: *const BufferEngine,
+        splice: Splice,
+        inserted: []const u8,
+        old_text: []const u8,
+    ) !struct { start: u32, end: u32 } {
+        if (splice.isAligned()) return .{ .start = splice.start, .end = splice.new_end };
+        var bounds = try SpliceBoundaries.init(self, splice, inserted, old_text);
+        defer bounds.deinit(self.allocator);
+        const start_byte = splice.left_context_bytes;
+        return .{
+            .start = splice.start + projectToBoundary(bounds.new, start_byte, .weak),
+            .end = splice.start + projectToBoundary(
+                bounds.new,
+                start_byte + @as(u32, @intCast(inserted.len)),
+                .sticky,
+            ),
+        };
+    }
+
+    /// Restores the text through the recorded inverses and the anchors from the snapshot.
+    /// Each inverse realizes an aligned splice on the state its operation produced, so the
+    /// text is restored exactly. Anchor ids consumed by rolled-back hidden anchors are not
+    /// reused. Allocation failure here leaves the document inconsistent (known issue).
+    fn rollbackPending(self: *BufferEngine, pending: *PendingMutation) void {
+        var index = pending.inverse_ops.items.len;
+        while (index > 0) {
+            index -= 1;
+            const edit = requestedEdit(pending.inverse_ops.items[index]);
+            self.table.replace(edit.start, edit.end, edit.text) catch |err| {
+                log.err("rolling back a rejected mutation: {s}", .{@errorName(err)});
+            };
+        }
+        std.mem.swap(
+            std.AutoHashMapUnmanaged(u32, anchors.Anchor),
+            &self.anchors_map,
+            &pending.anchors_before,
+        );
+        pending.deinit(self.allocator);
+    }
+
+    /// Commits applied operations as one revision and notifies view providers.
+    /// On allocation failure before the revision advances, the mutation is rolled back.
+    fn commitPending(
+        self: *BufferEngine,
+        pending: *PendingMutation,
         ops: []const types.BufferOp,
         source: []const u8,
         cause: []const u8,
     ) !MutationCommit {
-        if (ops.len == 0) return error.InvalidArgument;
-
-        var inverse_ops = try std.ArrayListUnmanaged(types.BufferOp).initCapacity(self.allocator, ops.len);
-        errdefer {
-            for (inverse_ops.items) |inv| {
-                switch (inv) {
-                    .insert => |ins| self.allocator.free(ins.text),
-                    .replace => |rep| self.allocator.free(rep.text),
-                    else => {},
-                }
+        errdefer self.rollbackPending(pending);
+        const owned_source = try self.allocator.dupe(u8, source);
+        errdefer self.allocator.free(owned_source);
+        const owned_cause = try self.allocator.dupe(u8, cause);
+        errdefer self.allocator.free(owned_cause);
+        const forward_revs = try self.allocator.alloc(u32, 1);
+        errdefer self.allocator.free(forward_revs);
+        const affected_ranges = try pending.affected_ranges.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(affected_ranges);
+        const deletion_metas: []const types.DeletionMeta = if (pending.deletion_metas.items.len > 0)
+            try pending.deletion_metas.toOwnedSlice(self.allocator)
+        else
+            &.{};
+        errdefer if (deletion_metas.len > 0) {
+            for (deletion_metas) |meta| {
+                var owned = meta;
+                owned.deinit(self.allocator);
             }
-            inverse_ops.deinit(self.allocator);
-        }
-
-        var affected_ranges = try std.ArrayListUnmanaged(types.Range).initCapacity(self.allocator, ops.len);
-        defer affected_ranges.deinit(self.allocator);
-
-        var deletion_metas = std.ArrayListUnmanaged(types.DeletionMeta).empty;
-        errdefer {
-            for (deletion_metas.items) |*meta| meta.deinit(self.allocator);
-            if (deletion_metas.items.len > 0) self.allocator.free(deletion_metas.items);
-            deletion_metas = .empty;
-        }
-
-        for (ops) |op| {
-            const edit = requestedEdit(op);
-            const splice = try self.table.planReplace(edit.start, edit.end, edit.text);
-            const inv = self.inverseForSplice(splice, try self.table.getTextRange(splice.start, splice.old_end));
-            inverse_ops.appendAssumeCapacity(inv);
-
-            if (try self.captureDeletionMeta(edit.start, edit.end, splice.start, inv)) |meta| {
-                errdefer {
-                    var owned = meta;
-                    owned.deinit(self.allocator);
-                }
-                try deletion_metas.append(self.allocator, meta);
-            }
-
-            try self.table.applySplice(splice, edit.text);
-            try self.rebaseAnchorsForSplice(splice, edit.text, restoredText(inv));
-            affected_ranges.appendAssumeCapacity(.{ .start = splice.start, .end = splice.new_end });
-        }
+            self.allocator.free(deletion_metas);
+        };
+        // Last fallible step: rollback needs the inverses until here.
+        const inverse_ops = try pending.inverse_ops.toOwnedSlice(self.allocator);
+        std.mem.reverse(types.BufferOp, inverse_ops);
+        pending.anchors_before.deinit(self.allocator);
+        pending.* = undefined;
 
         const old_revision = self.revision;
         self.revision += 1;
-
-        const event = types.EditEvent{
-            .old_revision = old_revision,
-            .new_revision = self.revision,
-            .affected_ranges = try affected_ranges.toOwnedSlice(self.allocator),
-            .edit_class = editClass(ops),
-            .source = try self.allocator.dupe(u8, source),
-            .cause = try self.allocator.dupe(u8, cause),
-        };
-
-        const owned_inverse_ops = blk: {
-            const owned = try inverse_ops.toOwnedSlice(self.allocator);
-            std.mem.reverse(types.BufferOp, owned);
-            break :blk owned;
-        };
-        inverse_ops = std.ArrayListUnmanaged(types.BufferOp).empty;
-
-        var forward_revs = try self.allocator.alloc(u32, 1);
-        errdefer self.allocator.free(forward_revs);
         forward_revs[0] = self.revision;
-
-        try self.notifyViewProviders(&event);
-
         return .{
-            .event = event,
+            .event = .{
+                .old_revision = old_revision,
+                .new_revision = self.revision,
+                .affected_ranges = affected_ranges,
+                .edit_class = editClass(ops),
+                .source = owned_source,
+                .cause = owned_cause,
+            },
             .undo_entry = .{
                 .forward_revs = forward_revs,
-                .inverse_ops = owned_inverse_ops,
-                .deletion_metas = if (deletion_metas.items.len > 0)
-                    try deletion_metas.toOwnedSlice(self.allocator)
-                else
-                    &.{},
+                .inverse_ops = inverse_ops,
+                .deletion_metas = deletion_metas,
             },
         };
+    }
+
+    /// Applies and commits operations that are expected to be valid (direct application,
+    /// undo and redo). A rejection rolls back and returns error.InvalidArgument.
+    fn applyOpsCommitted(
+        self: *BufferEngine,
+        ops: []const types.BufferOp,
+        source: []const u8,
+        cause: []const u8,
+        history: *std.ArrayListUnmanaged(types.UndoEntry),
+    ) !types.EditEvent {
+        var pending = switch (try self.applyOpsPending(ops, null)) {
+            .applied => |applied| applied,
+            .rejected => |message| {
+                defer self.allocator.free(message);
+                log.debug("rejected direct mutation: {s}", .{message});
+                return error.InvalidArgument;
+            },
+        };
+        return self.finishCommit(&pending, ops, source, cause, history);
+    }
+
+    /// Commits applied operations as one revision, records the undo entry on `history`
+    /// and notifies view providers. Everything that can fail is reserved first, so an
+    /// error rolls the mutation back and nothing after the commit can fail.
+    fn finishCommit(
+        self: *BufferEngine,
+        pending: *PendingMutation,
+        ops: []const types.BufferOp,
+        source: []const u8,
+        cause: []const u8,
+        history: *std.ArrayListUnmanaged(types.UndoEntry),
+    ) !types.EditEvent {
+        var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer seen.deinit(self.allocator);
+        self.reserveCommit(history, &seen) catch |err| {
+            self.rollbackPending(pending);
+            return err;
+        };
+        const commit = try self.commitPending(pending, ops, source, cause);
+        history.appendAssumeCapacity(commit.undo_entry);
+        self.notifyViewProviders(&commit.event, &seen);
+        return commit.event;
+    }
+
+    fn reserveCommit(
+        self: *BufferEngine,
+        history: *std.ArrayListUnmanaged(types.UndoEntry),
+        seen: *std.AutoHashMapUnmanaged(usize, void),
+    ) !void {
+        try history.ensureUnusedCapacity(self.allocator, 1);
+        try seen.ensureTotalCapacity(self.allocator, @intCast(self.view_providers.count()));
     }
 
     pub fn applyMutation(

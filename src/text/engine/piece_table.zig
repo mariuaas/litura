@@ -202,6 +202,31 @@ pub const PieceTable = struct {
         right: ?nodes.Piece,
     };
 
+    /// A requested replacement widened to grapheme boundaries that exist both before and
+    /// after the edit. Old graphemes [start, old_end) become new graphemes [start, new_end).
+    /// Context graphemes are unrequested neighbours rewritten because their boundaries changed.
+    pub const Splice = struct {
+        start: u32,
+        old_end: u32,
+        new_end: u32,
+        left_context: u32 = 0,
+        right_context: u32 = 0,
+        left_context_bytes: u32 = 0,
+        right_context_bytes: u32 = 0,
+
+        pub fn isAligned(self: Splice) bool {
+            return self.left_context == 0 and self.right_context == 0;
+        }
+
+        pub fn requestedStart(self: Splice) u32 {
+            return self.start + self.left_context;
+        }
+
+        pub fn requestedEnd(self: Splice) u32 {
+            return self.old_end - self.right_context;
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator) !PieceTable {
         const empty_leaf = try allocator.create(nodes.Leaf);
         empty_leaf.* = .{};
@@ -706,31 +731,6 @@ pub const PieceTable = struct {
         return null;
     }
 
-    /// A requested replacement widened to grapheme boundaries that exist both before and
-    /// after the edit. Old graphemes [start, old_end) become new graphemes [start, new_end).
-    /// Context graphemes are unrequested neighbours rewritten because their boundaries changed.
-    pub const Splice = struct {
-        start: u32,
-        old_end: u32,
-        new_end: u32,
-        left_context: u32 = 0,
-        right_context: u32 = 0,
-        left_context_bytes: u32 = 0,
-        right_context_bytes: u32 = 0,
-
-        pub fn isAligned(self: Splice) bool {
-            return self.left_context == 0 and self.right_context == 0;
-        }
-
-        pub fn requestedStart(self: Splice) u32 {
-            return self.start + self.left_context;
-        }
-
-        pub fn requestedEnd(self: Splice) u32 {
-            return self.old_end - self.right_context;
-        }
-    };
-
     pub fn insert(self: *PieceTable, pos: u32, text: []const u8) !void {
         try self.replace(pos, pos, text);
     }
@@ -739,6 +739,9 @@ pub const PieceTable = struct {
         try self.replace(start, end, "");
     }
 
+    /// Replaces graphemes [start, end) with UTF-8 text and resegments any neighbours whose
+    /// boundaries change; the caller keeps ownership of text, which is copied.
+    /// Range errors change nothing. For allocation failure, see applySplice.
     pub fn replace(self: *PieceTable, start: u32, end: u32, text: []const u8) !void {
         try self.applySplice(try self.planReplace(start, end, text), text);
     }
@@ -747,6 +750,8 @@ pub const PieceTable = struct {
     /// Boundaries before the edit cannot change, and UAX #29 segmentation restarted at a
     /// boundary reproduces the whole-text result. The plan therefore starts at the last
     /// surviving boundary and extends right until old and new segmentations share one.
+    /// Scratch text is allocated and freed here. Rejects a range past the end with
+    /// error.OutOfRange and start > end with error.InvalidRange.
     pub fn planReplace(self: *const PieceTable, start: u32, end: u32, text: []const u8) !Splice {
         try self.validateRange(start, end);
 
@@ -795,37 +800,40 @@ pub const PieceTable = struct {
         };
     }
 
-    /// Applies a plan from planReplace to the table it was planned against. Rewritten
-    /// context is copied with the text so every piece boundary stays a grapheme boundary.
+    /// Applies a plan from planReplace to the unchanged table it was planned against.
+    /// Rewritten context is copied with the text so every piece boundary stays a grapheme
+    /// boundary. The add buffer and the new pieces are prepared before the old range is
+    /// removed, so an earlier allocation failure leaves the text unchanged (the add buffer
+    /// may grow; it is append-only). Failure while inserting the prepared pieces into the
+    /// tree leaves the old range removed and the new text missing.
     pub fn applySplice(self: *PieceTable, splice: Splice, text: []const u8) !void {
-        if (splice.isAligned()) {
-            if (splice.start != splice.old_end) try self.deleteAligned(splice.start, splice.old_end);
-            if (text.len == 0) return;
-            const add_offset = self.add_buf.items.len;
-            try self.add_buf.appendSlice(self.allocator, text);
-            return self.insertAdded(splice.start, add_offset, text.len);
-        }
-
-        const left = try self.getTextRange(splice.start, splice.requestedStart());
-        defer self.allocator.free(left);
-        const right = try self.getTextRange(splice.requestedEnd(), splice.old_end);
-        defer self.allocator.free(right);
-
         const add_offset = self.add_buf.items.len;
-        try self.add_buf.appendSlice(self.allocator, left);
-        try self.add_buf.appendSlice(self.allocator, text);
-        try self.add_buf.appendSlice(self.allocator, right);
-        try self.deleteAligned(splice.start, splice.old_end);
-        try self.insertAdded(splice.start, add_offset, self.add_buf.items.len - add_offset);
+        if (splice.isAligned()) {
+            try self.add_buf.appendSlice(self.allocator, text);
+        } else {
+            const left = try self.getTextRange(splice.start, splice.requestedStart());
+            defer self.allocator.free(left);
+            const right = try self.getTextRange(splice.requestedEnd(), splice.old_end);
+            defer self.allocator.free(right);
+            try self.add_buf.appendSlice(self.allocator, left);
+            try self.add_buf.appendSlice(self.allocator, text);
+            try self.add_buf.appendSlice(self.allocator, right);
+        }
+        const pieces = try self.makePiecesChunked(
+            .add,
+            add_offset,
+            self.add_buf.items.len - add_offset,
+        );
+        defer self.allocator.free(pieces);
+
+        if (splice.start != splice.old_end) try self.deleteAligned(splice.start, splice.old_end);
+        try self.insertPieces(splice.start, pieces);
     }
 
-    fn insertAdded(self: *PieceTable, pos: u32, add_offset: usize, len: usize) !void {
-        const inserted_pieces = try self.makePiecesChunked(.add, add_offset, len);
-        defer self.allocator.free(inserted_pieces);
-
+    fn insertPieces(self: *PieceTable, pos: u32, pieces: []const nodes.Piece) !void {
         var current_pos = pos;
-        for (inserted_pieces) |inserted| {
-            if (try self.insertInto(self.root, current_pos, inserted)) |overflow| {
+        for (pieces) |piece| {
+            if (try self.insertInto(self.root, current_pos, piece)) |overflow| {
                 const new_root = try self.allocator.create(nodes.Internal);
                 new_root.* = .{};
                 try new_root.children.append(self.allocator, overflow.left);
@@ -833,7 +841,7 @@ pub const PieceTable = struct {
                 nodes.recomputeNode(.{ .internal = new_root });
                 self.root = .{ .internal = new_root };
             }
-            current_pos += inserted.summary.graphemes;
+            current_pos += piece.summary.graphemes;
         }
     }
 

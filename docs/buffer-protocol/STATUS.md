@@ -4,10 +4,10 @@ This describes the standalone Zig library against the [v0.1 draft specification]
 
 ## Implemented
 
-- Piece-table text storage, Unicode grapheme segmentation, line navigation, byte-exact search, summaries and bounded region reads.
+- Piece-table text storage, Unicode 16.0 grapheme segmentation, line navigation, byte-exact search, summaries and bounded region reads. Edits are realized as grapheme-aligned splices, checked against Unicode's conformance data.
 - Sticky and weak anchors, revision tracking, sessions, cursors and selection marks.
 - Native mutation intents, revision-origin checks, guards and validation reports.
-- Composite buffer/interaction submission, document-wide undo/redo and edit events.
+- Composite buffer/interaction submission, document-wide undo/redo and edit events. Payloads are validated exactly and roll back atomically on rejection; composite interactions can refer to buffer-operation results (`EditRef`).
 - Derived-view registration, capabilities and available/stale/partial/unavailable state reporting.
 - Native callback evaluation with bounded document access and fuel charged for view operations.
 - Optional Tree-sitter tokens and syntax for Lua, Zig and Fennel, including revision-scoped syntax references.

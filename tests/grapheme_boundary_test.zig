@@ -282,7 +282,10 @@ test "undo of a joining deletion restores text and resurrects interior weak anch
     try submitOps(&engine, &.{.{ .delete = .{ .start = 1, .end = 4 } }});
     try expectText(&engine, decomposed);
     try std.testing.expectEqual(@as(u32, 1), engine.graphemeCount());
-    try std.testing.expectEqual(litura.anchors.AnchorStatus.dead, (try engine.queryAnchor(interior)).status);
+    try std.testing.expectEqual(
+        litura.anchors.AnchorStatus.dead,
+        (try engine.queryAnchor(interior)).status,
+    );
 
     try submitHistory(&engine, .undo);
     try expectText(&engine, "e\nX\n\u{0301}");
@@ -329,11 +332,17 @@ test "SPEC 2.5.1 and 7: inverse and affected range come from the realized splice
     defer engine.deinit();
     var result = try engine.submit(.{
         .origin = engine.revision,
-        .payload = .{ .buffer_mutation = .{ .ops = &.{.{ .insert = .{ .pos = 1, .text = "\u{0301}" } }} } },
+        .payload = .{
+            .buffer_mutation = .{ .ops = &.{.{ .insert = .{ .pos = 1, .text = "\u{0301}" } }} },
+        },
     });
     defer result.deinit(allocator);
     // Non-empty affected range with an unchanged grapheme count.
-    try std.testing.expectEqualSlices(litura.types.Range, &.{.{ .start = 0, .end = 1 }}, result.edit_event.affected_ranges);
+    try std.testing.expectEqualSlices(
+        litura.types.Range,
+        &.{.{ .start = 0, .end = 1 }},
+        result.edit_event.affected_ranges,
+    );
     const inverse = engine.undo_stack.items[0].inverse_ops[0].replace;
     try std.testing.expectEqual(@as(u32, 0), inverse.start);
     try std.testing.expectEqual(@as(u32, 1), inverse.end);

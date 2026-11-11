@@ -981,7 +981,7 @@ restore buffer state. Interaction state (selections, registers) is not recorded
 in the undo lineage. Pure interaction mutations do not generate an `UndoEntry`.
 When undoing a `Composite` intent, only the `BufferOp`s are reverted. The
 interaction state itself is not rolled back, nor does the `InteractionRevision`
-advance. Instead, the `AnchorId`s within selections passively undergo standard
+advance (§2.6: no buffer edit advances it). Instead, the `AnchorId`s within selections passively undergo standard
 geometric rebasing against the reverted buffer state (which may cause selections
 to shrink, collapse, or become degenerate), while non-spatial interaction state
 (active edge designations, register contents) persists unchanged.
@@ -1130,6 +1130,26 @@ engine owns anchor rebasing and anchor query. The session/editor layer owns the
 pairing of anchors into selections, the active-edge interpretation, and the
 derived range status over paired anchors.
 
+**Normative constraint (interaction revision):** `InteractionRevision` versions
+interaction state: which anchors form selections, their active edges, and
+register contents. It advances only when interaction state is explicitly
+mutated (an applied `InteractionMutation`, or the interaction part of a
+`Composite`). Passive anchor rebasing caused by buffer edits, including undo,
+redo and lineage resurrection, never advances it. An anchor's position is a
+fact of the buffer revision; the `EditEvent` of that revision is the causal
+notification for passive anchor changes. Observable cursor and selection
+positions are therefore a function of both the buffer revision and the
+interaction revision.
+
+**Normative constraint (coordinates in interaction requests):** An interaction
+operation that carries a `Position` is coordinate-bearing. It is valid only at
+the buffer revision it was computed against: the engine validates the intent's
+`origin.buffer_revision` and either rebases the position (§6.2) or rejects the
+intent as `Stale { reason: BufferAdvanced }`. An interaction CAS match alone
+does not make a position current, because buffer edits do not advance the
+interaction revision. Operations that refer only to `AnchorId`s are
+anchor-scoped and follow anchor liveness and guard semantics instead.
+
 **Register constraints (normative):**
 
 - Registers are session-local and non-authoritative. They must not be required
@@ -1166,6 +1186,47 @@ buffer and interaction state at the moment of validation). Execution applies
 `interaction_ops` are then applied in the context of the newly rebased anchors.
 The entire composite application is atomic — if either phase fails, neither
 takes effect.
+
+Origins, guards and the interaction CAS are checked against the pre-application
+snapshot. Positions carried by `interaction_ops` address the text produced by
+`buffer_ops`. Because that text's grapheme count cannot be predicted from the
+requested operations (§1.4), those positions are validated against the
+produced state, with the atomicity of §4.1.
+
+**Symbolic edit references (normative).** Within a `Composite`, an interaction
+operation may designate a position by reference to the realized result of one
+of its buffer operations, instead of computing that position itself:
+
+```
+InteractionTarget = Position | EditRef
+
+EditRef = {
+    op   : nat          -- index into the Composite's buffer_ops, in order
+    edge : Start | End
+}
+```
+
+The engine resolves an `EditRef` during application:
+
+- `End` behaves as a Sticky anchor created when operation `op` completes, at
+  the Sticky projection (§1.4) of the end of its inserted text. `Start` behaves
+  as a Weak anchor at the Weak projection of the start of its inserted text.
+- The anchor is rebased through the later buffer operations by the ordinary
+  algebra and resolved after the last of them. A later insertion at an `End`
+  reference moves it, as it would any Sticky anchor.
+- If the anchor is dead when resolved, or `op` does not name a buffer operation
+  of the same `Composite`, the intent is `Invalid` with no effect (§4.1).
+- The anchors are internal: they are not observable, and their identifiers are
+  not reused.
+
+Examples: in `e`, `Insert(1, U+0301)` resolves `End` to `1` (after `é`) and
+`Start` to `0`. On `ab`, `[Insert(2, "X"), Insert(0, "YY")]` resolves `End` of
+operation `0` to `5`.
+
+An `EditRef` carries no client-computed coordinate, so it is not
+coordinate-bearing. It addresses positioning within one transaction only.
+Interpreting a request computed at an earlier revision is a separate problem
+(§11, item 11).
 
 **Normative constraint (buffer operation ordering):** `BufferOp` arrays within
 `BufferMutation` and `Composite` follow the same transaction-log semantics as
@@ -1430,6 +1491,16 @@ a payload from one snapshot must not assume adjacent targets are independent.
 Because grapheme deltas depend on realized splices, validating operation N
 against the sequential model requires the realized effect of operations
 0..N-1, not lengths computed from their requested text.
+
+**Normative constraint (payload atomicity):** If any operation in a payload is
+invalid against the state produced by its predecessors, the whole payload is
+rejected with no observable effect. Text, anchors (including anchors killed by
+earlier operations), revision, undo and redo history, interaction state and
+events are as before submission. The same holds when a `Composite`'s
+interaction operations are invalid against the text its buffer operations
+produce. An engine may validate by applying operations provisionally and
+rolling back with their realized inverses (§2.5.1). Identifiers consumed
+internally during a rolled-back application are not reused.
 
 ### 4.2 Intent
 
@@ -2724,13 +2795,20 @@ Items deferred from this draft, required before stabilization:
     acknowledgment, and queue reconciliation (§7.1, §7.2). Distributed merge
     semantics (e.g., peer-to-peer CRDTs or multi-user operational
     transformation) remain deferred as an external coordination layer.
-11. **Coordinate rebasing outside the engine**: open. Grapheme coordinates are
-    not additive (§1.3), so rebasing a position across an edit requires the
-    realized splice, the requested range, and enough text to project (§1.4).
-    `affected_ranges` alone is insufficient for §6.2 positional rebasing and
-    §7.2 client reconciliation. A client that rebases speculatively must also
-    segment with the same profile as the engine. Proposed resolution:
-    `EditEvent` carries realized splices (old and new extents), and
-    `EngineCapabilities` advertises the segmentation profile (for example
-    `"UAX29-extended/16.0.0"`). Changing the profile of an existing buffer is a
+11. **Coordinate rebasing across revisions**: open. This is distinct from
+    positioning within one transaction, which `EditRef` resolves (§2.6.1). The
+    open problem is interpreting a request computed at revision `r` after
+    revisions `r+1..head` have been committed, by another client, an extension
+    or the same client's in-flight intents. Grapheme coordinates are not
+    additive (§1.3), so rebasing a position across a committed edit requires
+    the realized splice, the requested range, and enough text to project
+    (§1.4). `affected_ranges` alone is insufficient for §6.2 positional
+    rebasing and §7.2 client reconciliation. A client that rebases
+    speculatively must also segment with the same profile as the engine.
+    Candidate mechanisms: the engine retains splice history for a bounded
+    window and rebases or rejects (`Stale`) server-side; `EditEvent` carries
+    realized splices for client-side rebasing; and `EngineCapabilities`
+    advertises the segmentation profile (for example
+    `"UAX29-extended/16.0.0"`). Until resolved, engines may reject stale
+    positional intents. Changing the profile of an existing buffer is a
     coordinate migration, not an edit, and is unspecified.

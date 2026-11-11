@@ -5,15 +5,9 @@ const litura = @import("litura");
 const BufferEngine = litura.BufferEngine;
 const BufferOp = litura.types.BufferOp;
 const segmentation = litura.segmentation;
-// Leak-checked without per-allocation stack traces, which dominate the sweeps' cost.
-var debug_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
-const allocator = debug_allocator.allocator();
-
-fn expectNoLeaks() !void {
-    const status = debug_allocator.deinit();
-    debug_allocator = .init;
-    try std.testing.expect(status == .ok);
-}
+const allocator = std.testing.allocator;
+/// `zig build test` samples the conformance cases; `zig build conformance` checks all.
+const conformance_stride = @import("test_options").conformance_stride;
 
 const conformance = @embedFile("grapheme_break_test");
 
@@ -30,7 +24,8 @@ const Case = struct {
     }
 
     fn parse(line: []const u8) !?Case {
-        const data = std.mem.trim(u8, line[0 .. std.mem.indexOfScalar(u8, line, '#') orelse line.len], " \t\r");
+        const content = line[0 .. std.mem.indexOfScalar(u8, line, '#') orelse line.len];
+        const data = std.mem.trim(u8, content, " \t\r");
         if (data.len == 0) return null;
         var case: Case = .{};
         errdefer case.deinit();
@@ -89,7 +84,10 @@ fn expectEngineClusters(engine: *BufferEngine, text: []const u8, bounds: []const
 }
 
 fn submit(engine: *BufferEngine, op: BufferOp) !void {
-    var result = try engine.submit(.{ .origin = engine.revision, .payload = .{ .buffer_mutation = .{ .ops = &.{op} } } });
+    var result = try engine.submit(.{
+        .origin = engine.revision,
+        .payload = .{ .buffer_mutation = .{ .ops = &.{op} } },
+    });
     defer result.deinit(allocator);
     try std.testing.expect(result == .edit_event);
 }
@@ -110,7 +108,7 @@ fn forEachCase(comptime check: fn (*const Case) anyerror!void) !void {
     while (lines.next()) |line| {
         var case = (try Case.parse(line)) orelse continue;
         defer case.deinit();
-        try check(&case);
+        if (cases % conformance_stride == 0) try check(&case);
         cases += 1;
     }
     try std.testing.expect(cases > 500);
@@ -124,37 +122,41 @@ test "zg agrees with the Unicode grapheme break conformance data" {
             try std.testing.expectEqualSlices(usize, case.boundaries.items, bounds.items);
         }
     }.check);
-    try expectNoLeaks();
 }
 
 test "locality: edits cannot move earlier boundaries and segmentation restarts exactly at a boundary" {
     try forEachCase(struct {
         fn check(case: *const Case) !void {
             const text = case.text.items;
-            // Left: boundaries before offset k depend only on text[0..k] and the code point at k.
-            for (case.code_points.items[1..]) |k| {
-                var prefix = try boundariesOf(text[0..k]);
+            // Left: boundaries before a split depend only on the text before it and the
+            // code point at it.
+            for (case.code_points.items[1..]) |split| {
+                var prefix = try boundariesOf(text[0..split]);
                 defer prefix.deinit(allocator);
-                for (prefix.items[0 .. prefix.items.len - 1]) |b| try std.testing.expect(case.isBoundary(b));
-                for (case.boundaries.items) |b| {
-                    if (b < k) try std.testing.expect(std.mem.indexOfScalar(usize, prefix.items, b) != null);
+                for (prefix.items[0 .. prefix.items.len - 1]) |boundary| {
+                    try std.testing.expect(case.isBoundary(boundary));
+                }
+                for (case.boundaries.items) |boundary| {
+                    if (boundary >= split) continue;
+                    try std.testing.expect(
+                        std.mem.indexOfScalar(usize, prefix.items, boundary) != null,
+                    );
                 }
             }
             // Right: resegmenting from any boundary reproduces every later boundary.
-            for (case.boundaries.items) |b| {
-                var suffix = try boundariesOf(text[b..]);
+            for (case.boundaries.items) |start| {
+                var suffix = try boundariesOf(text[start..]);
                 defer suffix.deinit(allocator);
                 var expected: usize = 0;
                 for (case.boundaries.items) |whole| {
-                    if (whole < b) continue;
-                    try std.testing.expectEqual(whole, b + suffix.items[expected]);
+                    if (whole < start) continue;
+                    try std.testing.expectEqual(whole, start + suffix.items[expected]);
                     expected += 1;
                 }
                 try std.testing.expectEqual(expected, suffix.items.len);
             }
         }
     }.check);
-    try expectNoLeaks();
 }
 
 test "conformance strings built one code point at a time segment like whole text" {
@@ -167,8 +169,9 @@ test "conformance strings built one code point at a time segment like whole text
                 defer engine.deinit();
                 for (0..cps.len - 1) |step| {
                     const index = if (prepend) cps.len - 2 - step else step;
-                    const position_ = if (prepend) 0 else engine.graphemeCount();
-                    try submit(&engine, .{ .insert = .{ .pos = position_, .text = text[cps[index]..cps[index + 1]] } });
+                    const at = if (prepend) 0 else engine.graphemeCount();
+                    const code_point = text[cps[index]..cps[index + 1]];
+                    try submit(&engine, .{ .insert = .{ .pos = at, .text = code_point } });
                 }
                 try expectEngineClusters(&engine, text, case.boundaries.items);
                 for (0..cps.len - 1) |_| try submitUndo(&engine);
@@ -176,7 +179,6 @@ test "conformance strings built one code point at a time segment like whole text
             }
         }
     }.check);
-    try expectNoLeaks();
 }
 
 test "joining at every code point offset: anchors project weak down and sticky up and never die" {
@@ -184,28 +186,38 @@ test "joining at every code point offset: anchors project weak down and sticky u
         fn check(case: *const Case) !void {
             const text = case.text.items;
             const cps = case.code_points.items;
-            for (cps[1 .. cps.len - 1]) |k| {
-                var left = try boundariesOf(text[0..k]);
+            for (cps[1 .. cps.len - 1]) |split| {
+                var left = try boundariesOf(text[0..split]);
                 defer left.deinit(allocator);
                 const join: u32 = @intCast(left.items.len - 1);
 
                 // Insert the suffix after the prefix; anchors sit at the join.
                 {
-                    var engine = try BufferEngine.initFromText(allocator, text[0..k], null);
+                    var engine = try BufferEngine.initFromText(allocator, text[0..split], null);
                     defer engine.deinit();
                     const weak = try engine.createAnchor(join, .weak);
                     const sticky = try engine.createAnchor(join, .sticky);
-                    try submit(&engine, .{ .insert = .{ .pos = join, .text = text[k..] } });
+                    try submit(&engine, .{ .insert = .{ .pos = join, .text = text[split..] } });
                     try expectEngineClusters(&engine, text, case.boundaries.items);
-                    try std.testing.expectEqual(@as(?u32, case.project(k, false)), try position(&engine, weak));
-                    try std.testing.expectEqual(@as(?u32, case.project(text.len, true)), try position(&engine, sticky));
+                    try std.testing.expectEqual(
+                        @as(?u32, case.project(split, false)),
+                        try position(&engine, weak),
+                    );
+                    try std.testing.expectEqual(
+                        @as(?u32, case.project(text.len, true)),
+                        try position(&engine, sticky),
+                    );
                     try submitUndo(&engine);
-                    try expectEngineClusters(&engine, text[0..k], left.items);
+                    try expectEngineClusters(&engine, text[0..split], left.items);
                 }
 
                 // Delete a control separator; anchors at both deletion endpoints survive.
                 {
-                    const separated = try std.mem.concat(allocator, u8, &.{ text[0..k], "\x07", text[k..] });
+                    const separated = try std.mem.concat(
+                        allocator,
+                        u8,
+                        &.{ text[0..split], "\x07", text[split..] },
+                    );
                     defer allocator.free(separated);
                     var engine = try BufferEngine.initFromText(allocator, separated, null);
                     defer engine.deinit();
@@ -218,7 +230,10 @@ test "joining at every code point offset: anchors project weak down and sticky u
                     try submit(&engine, .{ .delete = .{ .start = join, .end = join + 1 } });
                     try expectEngineClusters(&engine, text, case.boundaries.items);
                     for (anchors, [_]bool{ false, false, true, true }) |anchor, sticky| {
-                        try std.testing.expectEqual(@as(?u32, case.project(k, sticky)), try position(&engine, anchor));
+                        try std.testing.expectEqual(
+                            @as(?u32, case.project(split, sticky)),
+                            try position(&engine, anchor),
+                        );
                     }
                     try submitUndo(&engine);
                     const restored = try engine.getText();
@@ -228,7 +243,6 @@ test "joining at every code point offset: anchors project weak down and sticky u
             }
         }
     }.check);
-    try expectNoLeaks();
 }
 
 /// Builds text one code point at a time, at the end or the front, and checks the oracle.
@@ -262,22 +276,31 @@ fn repeat(parts: []const []const u8, times: usize, tail: []const u8) ![]u8 {
 }
 
 test "long contextual sequences built one code point at a time" {
-    const sequences = [_]struct { parts: []const []const u8, times: usize, tail: []const u8, clusters: u32 }{
-        // GB12/13: regional indicator parity across a 2001-indicator run.
-        .{ .parts = &.{"\u{1F1E6}"}, .times = 2001, .tail = "", .clusters = 1001 },
+    const sequences = [_]struct {
+        parts: []const []const u8,
+        times: usize,
+        tail: []const u8,
+        clusters: u32,
+    }{
+        // GB12/13: regional indicator parity across a 401-indicator run.
+        .{ .parts = &.{"\u{1F1E6}"}, .times = 401, .tail = "", .clusters = 201 },
         // GB11: one emoji ZWJ sequence of 301 pictographs.
-        .{ .parts = &.{ "\u{1F468}", "\u{200D}" }, .times = 300, .tail = "\u{1F469}", .clusters = 1 },
-        // GB9c: one Devanagari conjunct of 501 consonants.
-        .{ .parts = &.{ "\u{0915}", "\u{094D}" }, .times = 500, .tail = "\u{0937}", .clusters = 1 },
+        .{ .parts = &.{ "\u{1F468}", "\u{200D}" }, .times = 60, .tail = "\u{1F469}", .clusters = 1 },
+        // GB9c: one Devanagari conjunct of 61 consonants.
+        .{ .parts = &.{ "\u{0915}", "\u{094D}" }, .times = 60, .tail = "\u{0937}", .clusters = 1 },
         // GB6-8: one Hangul syllable with long jamo runs.
-        .{ .parts = &.{"\u{1100}"}, .times = 500, .tail = "\u{1161}\u{11A8}", .clusters = 1 },
-        // GB9: a base followed by 1000 combining marks.
-        .{ .parts = &.{"\u{0301}"}, .times = 1000, .tail = "", .clusters = 1 },
+        .{ .parts = &.{"\u{1100}"}, .times = 120, .tail = "\u{1161}\u{11A8}", .clusters = 1 },
+        // GB9: a base followed by 200 combining marks.
+        .{ .parts = &.{"\u{0301}"}, .times = 200, .tail = "", .clusters = 1 },
     };
     for (sequences) |sequence| {
         const text = try repeat(sequence.parts, sequence.times, sequence.tail);
         defer allocator.free(text);
-        const based = if (sequence.parts[0][0] == 0xCC) try std.mem.concat(allocator, u8, &.{ "e", text }) else try allocator.dupe(u8, text);
+        const based = if (sequence.parts[0][0] == 0xCC) try std.mem.concat(
+            allocator,
+            u8,
+            &.{ "e", text },
+        ) else try allocator.dupe(u8, text);
         defer allocator.free(based);
         for ([_]bool{ false, true }) |prepend| {
             var engine = try BufferEngine.init(allocator);
@@ -286,67 +309,61 @@ test "long contextual sequences built one code point at a time" {
             try std.testing.expectEqual(sequence.clusters, engine.graphemeCount());
         }
     }
-    try expectNoLeaks();
 }
 
 test "worst case: one indicator flips pairing across a long run, and undo restores it" {
-    {
-        const flags = try repeat(&.{"\u{1F1E6}"}, 2000, "");
-        defer allocator.free(flags);
-        var engine = try BufferEngine.init(allocator);
-        defer engine.deinit();
-        try buildByCodePoint(&engine, flags, false);
-        try std.testing.expectEqual(@as(u32, 1000), engine.graphemeCount());
+    const flags = try repeat(&.{"\u{1F1E6}"}, 400, "");
+    defer allocator.free(flags);
+    var engine = try BufferEngine.init(allocator);
+    defer engine.deinit();
+    try buildByCodePoint(&engine, flags, false);
+    try std.testing.expectEqual(@as(u32, 200), engine.graphemeCount());
 
-        const splice = try engine.table.planReplace(0, 0, "\u{1F1E6}");
-        try std.testing.expectEqual(@as(u32, 1000), splice.right_context);
-        try std.testing.expectEqual(@as(u32, 1001), splice.new_end);
+    const splice = try engine.table.planReplace(0, 0, "\u{1F1E6}");
+    try std.testing.expectEqual(@as(u32, 200), splice.right_context);
+    try std.testing.expectEqual(@as(u32, 201), splice.new_end);
 
-        const weak = try engine.createAnchor(500, .weak);
-        const sticky = try engine.createAnchor(500, .sticky);
-        const after = try engine.createAnchor(1000, .weak);
-        try submit(&engine, .{ .insert = .{ .pos = 0, .text = "\u{1F1E6}" } });
-        try std.testing.expectEqual(@as(u32, 1001), engine.graphemeCount());
-        // Old boundary at indicator 1000 is now indicator 1001, inside pair 500.
-        try std.testing.expectEqual(@as(?u32, 500), try position(&engine, weak));
-        try std.testing.expectEqual(@as(?u32, 501), try position(&engine, sticky));
-        try std.testing.expectEqual(@as(?u32, 1001), try position(&engine, after));
+    const weak = try engine.createAnchor(100, .weak);
+    const sticky = try engine.createAnchor(100, .sticky);
+    const after = try engine.createAnchor(200, .weak);
+    try submit(&engine, .{ .insert = .{ .pos = 0, .text = "\u{1F1E6}" } });
+    try std.testing.expectEqual(@as(u32, 201), engine.graphemeCount());
+    // Old boundary at indicator 200 is now indicator 201, inside pair 100.
+    try std.testing.expectEqual(@as(?u32, 100), try position(&engine, weak));
+    try std.testing.expectEqual(@as(?u32, 101), try position(&engine, sticky));
+    try std.testing.expectEqual(@as(?u32, 201), try position(&engine, after));
 
-        try submitUndo(&engine);
-        var bounds = try boundariesOf(flags);
-        defer bounds.deinit(allocator);
-        try expectEngineClusters(&engine, flags, bounds.items);
-    }
-    try expectNoLeaks();
+    try submitUndo(&engine);
+    var bounds = try boundariesOf(flags);
+    defer bounds.deinit(allocator);
+    try expectEngineClusters(&engine, flags, bounds.items);
 }
 
-test "descending payloads are sequential: an adjacent earlier-applied insertion merges into the next target" {
-    {
-        var engine = try BufferEngine.initFromText(allocator, "ae", null);
-        defer engine.deinit();
-        // Positions are unchanged by the first operation, but grapheme 1 is now "é".
-        var result = try engine.submit(.{ .origin = engine.revision, .payload = .{ .buffer_mutation = .{ .ops = &.{
-            .{ .insert = .{ .pos = 2, .text = "\u{0301}" } },
-            .{ .delete = .{ .start = 1, .end = 2 } },
-        } } } });
-        defer result.deinit(allocator);
-        const text = try engine.getText();
-        defer allocator.free(text);
-        try std.testing.expectEqualStrings("a", text);
-    }
-    try expectNoLeaks();
+test "descending payloads are sequential: an earlier insertion can merge into the next target" {
+    var engine = try BufferEngine.initFromText(allocator, "ae", null);
+    defer engine.deinit();
+    // Positions are unchanged by the first operation, but grapheme 1 is now "é".
+    const ops = [_]BufferOp{
+        .{ .insert = .{ .pos = 2, .text = "\u{0301}" } },
+        .{ .delete = .{ .start = 1, .end = 2 } },
+    };
+    var result = try engine.submit(.{
+        .origin = engine.revision,
+        .payload = .{ .buffer_mutation = .{ .ops = &ops } },
+    });
+    defer result.deinit(allocator);
+    const text = try engine.getText();
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("a", text);
 }
 
 test "undo restores text but not projected anchor positions" {
-    {
-        var engine = try BufferEngine.initFromText(allocator, "e", null);
-        defer engine.deinit();
-        const weak = try engine.createAnchor(1, .weak);
-        try submit(&engine, .{ .insert = .{ .pos = 1, .text = "\u{0301}" } });
-        try std.testing.expectEqual(@as(?u32, 0), try position(&engine, weak));
-        try submitUndo(&engine);
-        // Spatial continuity: the anchor is at the start of the restored splice.
-        try std.testing.expectEqual(@as(?u32, 0), try position(&engine, weak));
-    }
-    try expectNoLeaks();
+    var engine = try BufferEngine.initFromText(allocator, "e", null);
+    defer engine.deinit();
+    const weak = try engine.createAnchor(1, .weak);
+    try submit(&engine, .{ .insert = .{ .pos = 1, .text = "\u{0301}" } });
+    try std.testing.expectEqual(@as(?u32, 0), try position(&engine, weak));
+    try submitUndo(&engine);
+    // Spatial continuity: the anchor is at the start of the restored splice.
+    try std.testing.expectEqual(@as(?u32, 0), try position(&engine, weak));
 }

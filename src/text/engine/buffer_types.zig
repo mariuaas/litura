@@ -106,9 +106,36 @@ pub const SetCursorSelection = struct {
     mark_position: ?u32,
 };
 
+/// Which edge of a buffer operation's inserted text an EditRef designates.
+pub const EditEdge = enum { start, end };
+
+/// Symbolic reference to the realized result of a buffer operation in the same
+/// Composite (SPEC §2.6.1). `op` indexes the composite's buffer operations in order.
+/// `.end` resolves like a Sticky anchor at the end of the inserted text, `.start` like a
+/// Weak anchor at its start; both are carried through later operations.
+pub const EditRef = struct {
+    op: u32,
+    edge: EditEdge = .end,
+};
+
+/// A document position computed by the client, which must be current at the intent's
+/// document origin, or an EditRef the engine resolves after applying the buffer operations.
+pub const InteractionTarget = union(enum) {
+    position: u32,
+    edit: EditRef,
+};
+
+/// Places a session cursor and sets (or, with null, clears) its mark.
+pub const PlaceCursor = struct {
+    cursor: anchors.AnchorId,
+    at: InteractionTarget,
+    mark: ?InteractionTarget = null,
+};
+
 pub const InteractionOp = union(enum) {
     move_cursor_anchor: MoveCursorAnchor,
     set_cursor_selection: SetCursorSelection,
+    place_cursor: PlaceCursor,
 };
 
 pub const InteractionMutation = struct {

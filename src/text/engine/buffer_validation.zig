@@ -532,7 +532,7 @@ pub fn validationReportForStaleInteractionOrigin(
     return try validationReport(engine, intent, .stale, message, try engine.allocator.alloc(types.GuardEval, 0));
 }
 
-fn validateSimulatedRangeMessage(
+fn rangeMessage(
     allocator: std.mem.Allocator,
     start: u32,
     end: u32,
@@ -543,66 +543,19 @@ fn validateSimulatedRangeMessage(
     return null;
 }
 
-fn countGraphemes(engine: *const BufferEngine, text: []const u8) u32 {
-    var count: u32 = 0;
-    var iter = engine.table.seg.iterator(text);
-    while (iter.next() != null) count += 1;
-    return count;
-}
-
-pub fn validateBufferOpsAgainstLength(
-    engine: *const BufferEngine,
-    ops: []const types.BufferOp,
-    initial_length: u32,
-) !?[]u8 {
-    var length = initial_length;
-    if (ops.len == 0) return try engine.allocator.dupe(u8, "apply requires at least one operation");
-
-    for (ops) |op| {
-        switch (op) {
-            .insert => |ins| {
-                if (ins.pos > length) return try std.fmt.allocPrint(engine.allocator, "position {d} out of range", .{ins.pos});
-                length += countGraphemes(engine, ins.text);
-            },
-            .delete => |del| {
-                if (try validateSimulatedRangeMessage(engine.allocator, del.start, del.end, length)) |message| return message;
-                length -= del.end - del.start;
-            },
-            .replace => |rep| {
-                if (try validateSimulatedRangeMessage(engine.allocator, rep.start, rep.end, length)) |message| return message;
-                length = length - (rep.end - rep.start) + countGraphemes(engine, rep.text);
-            },
-        }
-    }
-
-    return null;
-}
-
-pub fn validateBufferOpsIntoLength(
-    engine: *const BufferEngine,
-    ops: []const types.BufferOp,
-    working_length: *u32,
-) !?[]u8 {
-    if (ops.len == 0) return try engine.allocator.dupe(u8, "apply requires at least one operation");
-
-    for (ops) |op| {
-        switch (op) {
-            .insert => |ins| {
-                if (ins.pos > working_length.*) return try std.fmt.allocPrint(engine.allocator, "position {d} out of range", .{ins.pos});
-                working_length.* += countGraphemes(engine, ins.text);
-            },
-            .delete => |del| {
-                if (try validateSimulatedRangeMessage(engine.allocator, del.start, del.end, working_length.*)) |message| return message;
-                working_length.* -= del.end - del.start;
-            },
-            .replace => |rep| {
-                if (try validateSimulatedRangeMessage(engine.allocator, rep.start, rep.end, working_length.*)) |message| return message;
-                working_length.* = working_length.* - (rep.end - rep.start) + countGraphemes(engine, rep.text);
-            },
-        }
-    }
-
-    return null;
+/// Validates one buffer operation against the current text, exactly. Operations in a
+/// payload are checked as they are applied: grapheme deltas are not additive (SPEC §1.4),
+/// so later operations cannot be validated from the earlier operations' requested text.
+pub fn bufferOpMessage(engine: *const BufferEngine, op: types.BufferOp) !?[]u8 {
+    const length = engine.table.graphemeCount();
+    return switch (op) {
+        .insert => |ins| if (ins.pos > length)
+            try std.fmt.allocPrint(engine.allocator, "position {d} out of range", .{ins.pos})
+        else
+            null,
+        .delete => |del| try rangeMessage(engine.allocator, del.start, del.end, length),
+        .replace => |rep| try rangeMessage(engine.allocator, rep.start, rep.end, length),
+    };
 }
 
 fn validateInteractionCursor(
@@ -616,6 +569,34 @@ fn validateInteractionCursor(
         }
     }
     return error.KeyError;
+}
+
+/// Whether an interaction mutation carries document positions, which are only meaningful
+/// at the document revision they were computed against.
+pub fn interactionHasPositions(payload: types.InteractionMutation) bool {
+    for (payload.ops) |op| switch (op) {
+        .move_cursor_anchor => return true,
+        .set_cursor_selection => |selection| if (selection.mark_position != null) return true,
+        .place_cursor => |place| {
+            if (place.at == .position) return true;
+            if (place.mark) |mark| if (mark == .position) return true;
+        },
+    };
+    return false;
+}
+
+/// Whether an interaction mutation refers symbolically to buffer operation results.
+/// Such references are resolved by the engine, not by the client, and are only
+/// meaningful inside a Composite.
+pub fn interactionHasEditRefs(payload: types.InteractionMutation) bool {
+    for (payload.ops) |op| switch (op) {
+        .place_cursor => |place| {
+            if (place.at == .edit) return true;
+            if (place.mark) |mark| if (mark == .edit) return true;
+        },
+        else => {},
+    };
+    return false;
 }
 
 pub fn validateInteractionMutation(
@@ -647,6 +628,31 @@ pub fn validateInteractionMutation(
                 };
                 if (selection.mark_position) |mark_position| {
                     if (mark_position > max_position) return try std.fmt.allocPrint(engine.allocator, "position {d} out of range", .{mark_position});
+                }
+            },
+            .place_cursor => |place| {
+                validateInteractionCursor(engine, payload.session_id, place.cursor) catch {
+                    return try std.fmt.allocPrint(
+                        engine.allocator,
+                        "cursor {d} is not part of session {d}",
+                        .{ place.cursor.value, payload.session_id },
+                    );
+                };
+                for ([_]?types.InteractionTarget{ place.at, place.mark }) |maybe_target| {
+                    const target = maybe_target orelse continue;
+                    switch (target) {
+                        .position => |position| if (position > max_position) {
+                            return try std.fmt.allocPrint(
+                                engine.allocator,
+                                "position {d} out of range",
+                                .{position},
+                            );
+                        },
+                        .edit => return try engine.allocator.dupe(
+                            u8,
+                            "edit references require a buffer operation in the same composite",
+                        ),
+                    }
                 }
             },
         }

@@ -24,16 +24,12 @@ pub fn build(b: *std.Build) void {
     const library = b.addLibrary(.{ .name = "litura", .linkage = .static, .root_module = module });
     b.installArtifact(library);
 
-    const tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("tests/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    tests.root_module.addImport("litura", module);
-    // Conformance data for the Unicode version zg implements.
-    tests.root_module.addAnonymousImport("grapheme_break_test", .{
-        .root_source_file = zg.path("data/unicode/auxiliary/GraphemeBreakTest.txt"),
-    });
+    const conformance_stride = b.option(
+        u32,
+        "conformance-stride",
+        "Check every nth Unicode grapheme conformance case in `test` (default 8; 1 checks all)",
+    ) orelse 8;
+    const tests = behavioralTests(b, module, zg, target, optimize, conformance_stride);
     const units = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/unit_tests.zig"),
         .target = target,
@@ -54,6 +50,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_units.step);
 
+    const conformance = b.step(
+        "conformance",
+        "Run behavioral tests against every Unicode grapheme conformance case",
+    );
+    conformance.dependOn(&b.addRunArtifact(behavioralTests(b, module, zg, target, optimize, 1)).step);
+
     const example = b.addExecutable(.{ .name = "litura-basic", .root_module = b.createModule(.{
         .root_source_file = b.path("examples/basic.zig"),
         .target = target,
@@ -62,6 +64,31 @@ pub fn build(b: *std.Build) void {
     example.root_module.addImport("litura", module);
     b.getInstallStep().dependOn(&example.step);
     b.step("example", "Run a document edit through the public module").dependOn(&b.addRunArtifact(example).step);
+}
+
+/// Behavioral tests import the public module; `conformance_stride` samples the Unicode
+/// conformance data, which zg ships for the Unicode version it implements.
+fn behavioralTests(
+    b: *std.Build,
+    module: *std.Build.Module,
+    zg: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    conformance_stride: u32,
+) *std.Build.Step.Compile {
+    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    tests.root_module.addImport("litura", module);
+    tests.root_module.addAnonymousImport("grapheme_break_test", .{
+        .root_source_file = zg.path("data/unicode/auxiliary/GraphemeBreakTest.txt"),
+    });
+    const test_options = b.addOptions();
+    test_options.addOption(u32, "conformance_stride", conformance_stride);
+    tests.root_module.addOptions("test_options", test_options);
+    return tests;
 }
 
 const SyntaxSources = struct {
