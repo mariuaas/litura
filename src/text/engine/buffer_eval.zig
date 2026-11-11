@@ -171,6 +171,8 @@ pub fn queryCapabilities() types.EngineCapabilities {
         .supported_group_modes = engine_group_modes[0..],
         .apply_policies = engine_apply_policies[0..],
         .program_carriers = engine_program_carriers[0..],
+        // Litura retains no splice history: every stale origin is rejected.
+        .rebase_policy = .reject,
         .limits = .{
             .max_fuel = max_eval_fuel,
             .max_lookahead = max_lookahead,

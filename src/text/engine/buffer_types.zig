@@ -488,6 +488,17 @@ pub const ProgramCarrierProfile = struct {
     notes: ?[]const u8,
 };
 
+/// How the engine treats coordinate-bearing intents whose origin is behind head
+/// (SPEC §6.2). Under neither policy are stale coordinates applied to text the client
+/// did not observe.
+pub const RebasePolicy = union(enum) {
+    /// Stale coordinates are rejected as `Stale` and never interpreted.
+    reject,
+    /// Coordinates are rebased across at most `window` revisions; older origins are
+    /// rejected as unavailable.
+    rebase: struct { window: u32 },
+};
+
 pub const EngineLimits = struct {
     max_fuel: u32,
     max_lookahead: u32,
@@ -510,5 +521,6 @@ pub const EngineCapabilities = struct {
     supported_group_modes: []const []const u8,
     apply_policies: []const []const u8,
     program_carriers: []const ProgramCarrierProfile,
+    rebase_policy: RebasePolicy,
     limits: EngineLimits,
 };

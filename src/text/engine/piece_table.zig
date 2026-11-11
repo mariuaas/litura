@@ -170,6 +170,8 @@ pub const PieceTable = struct {
     original_buf: std.ArrayListUnmanaged(u8) = .empty,
     add_buf: std.ArrayListUnmanaged(u8) = .empty,
     root: nodes.NodeRef,
+    /// The active mutation transaction, if any (see `begin`).
+    transaction: ?Transaction = null,
 
     const Location = struct {
         leaf: *nodes.Leaf,
@@ -227,6 +229,20 @@ pub const PieceTable = struct {
         }
     };
 
+    /// A mutation in progress. Edits build a candidate tree beside the committed one: a
+    /// committed node is copied on its first write, never written, so the committed tree
+    /// stays intact until `commit` publishes the candidate or `abort` discards it.
+    pub const Transaction = struct {
+        committed_root: nodes.NodeRef,
+        add_buf_len: usize,
+        /// Nodes this transaction created, threaded through `Ownership.next`.
+        created: ?nodes.NodeRef = null,
+        /// Committed nodes this transaction copied, threaded the same way.
+        replaced: ?nodes.NodeRef = null,
+        /// Committed nodes copied so far; a diagnostic for path-copy cost.
+        copied: u32 = 0,
+    };
+
     pub fn init(allocator: std.mem.Allocator) !PieceTable {
         const empty_leaf = try allocator.create(nodes.Leaf);
         empty_leaf.* = .{};
@@ -238,6 +254,7 @@ pub const PieceTable = struct {
     }
 
     pub fn deinit(self: *PieceTable) void {
+        std.debug.assert(self.transaction == null);
         freeNode(self.allocator, self.root);
         self.add_buf.deinit(self.allocator);
         self.original_buf.deinit(self.allocator);
@@ -245,20 +262,34 @@ pub const PieceTable = struct {
         self.* = undefined;
     }
 
+    /// Replaces the whole document. The new tree is built beside the current one and
+    /// swapped in only once complete, so on error the current document is unchanged.
     pub fn initFromText(self: *PieceTable, text: []const u8) !void {
+        std.debug.assert(self.transaction == null);
+        // Holds the new buffer until the swap, then the old one; freed either way.
+        var original: std.ArrayListUnmanaged(u8) = .empty;
+        defer original.deinit(self.allocator);
+        try original.appendSlice(self.allocator, text);
+        // Pieces are built against `original_buf`; nothing reads the old tree meanwhile.
+        std.mem.swap(std.ArrayListUnmanaged(u8), &self.original_buf, &original);
+        const root = self.buildRoot(text.len) catch |err| {
+            std.mem.swap(std.ArrayListUnmanaged(u8), &self.original_buf, &original);
+            return err;
+        };
         freeNode(self.allocator, self.root);
+        self.root = root;
         self.add_buf.clearRetainingCapacity();
-        self.original_buf.clearRetainingCapacity();
-        try self.original_buf.appendSlice(self.allocator, text);
-        if (text.len > 0) {
-            const chunked = try self.makePiecesChunked(.original, 0, text.len);
-            defer self.allocator.free(chunked);
-            self.root = try buildTree(self.allocator, chunked);
-        } else {
+    }
+
+    fn buildRoot(self: *const PieceTable, len: usize) !nodes.NodeRef {
+        if (len == 0) {
             const empty_leaf = try self.allocator.create(nodes.Leaf);
             empty_leaf.* = .{};
-            self.root = .{ .leaf = empty_leaf };
+            return .{ .leaf = empty_leaf };
         }
+        const chunked = try self.makePiecesChunked(.original, 0, len);
+        defer self.allocator.free(chunked);
+        return buildTree(self.allocator, chunked);
     }
 
     pub fn graphemeCount(self: *const PieceTable) u32 {
@@ -362,7 +393,8 @@ pub const PieceTable = struct {
                 for (n.children.items, 0..) |child, i| {
                     const g = child.summary().graphemes;
                     if (remaining < g or i == n.children.items.len - 1) {
-                        if (try self.insertInto(child, remaining, piece)) |overflow| {
+                        const target = try self.writable(&n.children.items[i]);
+                        if (try self.insertInto(target, remaining, piece)) |overflow| {
                             n.children.items[i] = overflow.left;
                             try n.children.insert(self.allocator, i + 1, overflow.right);
                         }
@@ -743,7 +775,139 @@ pub const PieceTable = struct {
     /// boundaries change; the caller keeps ownership of text, which is copied.
     /// Range errors change nothing. For allocation failure, see applySplice.
     pub fn replace(self: *PieceTable, start: u32, end: u32, text: []const u8) !void {
-        try self.applySplice(try self.planReplace(start, end, text), text);
+        const splice = try self.planReplace(start, end, text);
+        self.begin();
+        self.applySplice(splice, text) catch |err| {
+            self.abort();
+            return err;
+        };
+        self.commit();
+    }
+
+    /// Starts a transaction. Until `commit` or `abort`, edits apply to a candidate tree and
+    /// never write a node committed before `begin`. A failed edit may leave the candidate
+    /// inconsistent; then only `abort` is allowed. Does not allocate.
+    pub fn begin(self: *PieceTable) void {
+        std.debug.assert(self.transaction == null);
+        self.transaction = .{ .committed_root = self.root, .add_buf_len = self.add_buf.items.len };
+    }
+
+    /// Publishes the candidate tree, then frees the committed nodes it no longer uses.
+    /// Requires every edit since `begin` to have succeeded. Does not allocate or fail.
+    pub fn commit(self: *PieceTable) void {
+        const transaction = self.transaction.?;
+        self.transaction = null;
+        markReachable(self.root);
+
+        // Created nodes left unreachable were split, merged or deleted away.
+        var created = transaction.created;
+        while (created) |node| {
+            created = node.ownership().next;
+            if (!node.ownership().reachable) node.destroyShallow(self.allocator);
+        }
+        // A replaced node's children are shared with its copy unless they were removed.
+        // Parents are replaced before children, so free removed children first, while
+        // every replaced node can still be inspected.
+        var replaced = transaction.replaced;
+        while (replaced) |node| : (replaced = node.ownership().next) {
+            if (node == .internal) {
+                for (node.internal.children.items) |child| self.freeRemoved(child);
+            }
+        }
+        replaced = transaction.replaced;
+        while (replaced) |node| {
+            replaced = node.ownership().next;
+            node.destroyShallow(self.allocator);
+        }
+        settle(self.root);
+    }
+
+    /// Discards the candidate tree and restores the committed one. Never reads the
+    /// candidate, so it is safe after any failed edit. Does not allocate or fail.
+    pub fn abort(self: *PieceTable) void {
+        const transaction = self.transaction.?;
+        self.transaction = null;
+        var created = transaction.created;
+        while (created) |node| {
+            created = node.ownership().next;
+            node.destroyShallow(self.allocator);
+        }
+        var replaced = transaction.replaced;
+        while (replaced) |node| {
+            const ownership = node.ownership();
+            replaced = ownership.next;
+            ownership.* = .{};
+        }
+        self.root = transaction.committed_root;
+        self.add_buf.shrinkRetainingCapacity(transaction.add_buf_len);
+    }
+
+    /// Returns the node in `slot` in a form the transaction may write: the node itself if
+    /// the transaction created it, otherwise a copy that replaces it in `slot`. `slot` must
+    /// be the root or belong to a node the transaction may write.
+    fn writable(self: *PieceTable, slot: *nodes.NodeRef) !nodes.NodeRef {
+        if (slot.ownership().owned) return slot.*;
+        const copy = try self.copyNode(slot.*);
+        const transaction = &self.transaction.?;
+        const original = slot.ownership();
+        original.replaced = true;
+        original.next = transaction.replaced;
+        transaction.replaced = slot.*;
+        transaction.copied += 1;
+        slot.* = copy;
+        return copy;
+    }
+
+    fn copyNode(self: *PieceTable, node: nodes.NodeRef) !nodes.NodeRef {
+        switch (node) {
+            .leaf => |leaf| {
+                const copy = try self.createLeaf();
+                try copy.pieces.appendSlice(self.allocator, leaf.pieces.items);
+                copy.summary = leaf.summary;
+                return .{ .leaf = copy };
+            },
+            .internal => |internal| {
+                const copy = try self.createInternal();
+                try copy.children.appendSlice(self.allocator, internal.children.items);
+                copy.summary = internal.summary;
+                return .{ .internal = copy };
+            },
+        }
+    }
+
+    /// Creates an empty leaf owned by the transaction. It is recorded before it is linked
+    /// anywhere, so `abort` frees it whatever happens next.
+    fn createLeaf(self: *PieceTable) !*nodes.Leaf {
+        const leaf = try self.allocator.create(nodes.Leaf);
+        leaf.* = .{};
+        self.register(.{ .leaf = leaf });
+        return leaf;
+    }
+
+    fn createInternal(self: *PieceTable) !*nodes.Internal {
+        const internal = try self.allocator.create(nodes.Internal);
+        internal.* = .{};
+        self.register(.{ .internal = internal });
+        return internal;
+    }
+
+    fn register(self: *PieceTable, node: nodes.NodeRef) void {
+        const transaction = &self.transaction.?;
+        const ownership = node.ownership();
+        ownership.owned = true;
+        ownership.next = transaction.created;
+        transaction.created = node;
+    }
+
+    /// Frees a committed subtree that the candidate no longer references, stopping at
+    /// nodes it still reaches and at replaced nodes, which are freed separately.
+    fn freeRemoved(self: *PieceTable, node: nodes.NodeRef) void {
+        const ownership = node.ownership();
+        if (ownership.reachable or ownership.replaced) return;
+        if (node == .internal) {
+            for (node.internal.children.items) |child| self.freeRemoved(child);
+        }
+        node.destroyShallow(self.allocator);
     }
 
     /// Plans replacing [start, end) with text without mutating the table.
@@ -800,13 +964,12 @@ pub const PieceTable = struct {
         };
     }
 
-    /// Applies a plan from planReplace to the unchanged table it was planned against.
-    /// Rewritten context is copied with the text so every piece boundary stays a grapheme
-    /// boundary. The add buffer and the new pieces are prepared before the old range is
-    /// removed, so an earlier allocation failure leaves the text unchanged (the add buffer
-    /// may grow; it is append-only). Failure while inserting the prepared pieces into the
-    /// tree leaves the old range removed and the new text missing.
+    /// Applies a plan from planReplace to the candidate tree it was planned against, inside
+    /// an active transaction. Rewritten context is copied with the text so every piece
+    /// boundary stays a grapheme boundary. On error the candidate may be inconsistent; the
+    /// caller must `abort`, which restores the committed tree and the add buffer.
     pub fn applySplice(self: *PieceTable, splice: Splice, text: []const u8) !void {
+        std.debug.assert(self.transaction != null);
         const add_offset = self.add_buf.items.len;
         if (splice.isAligned()) {
             try self.add_buf.appendSlice(self.allocator, text);
@@ -833,11 +996,12 @@ pub const PieceTable = struct {
     fn insertPieces(self: *PieceTable, pos: u32, pieces: []const nodes.Piece) !void {
         var current_pos = pos;
         for (pieces) |piece| {
-            if (try self.insertInto(self.root, current_pos, piece)) |overflow| {
-                const new_root = try self.allocator.create(nodes.Internal);
-                new_root.* = .{};
-                try new_root.children.append(self.allocator, overflow.left);
-                try new_root.children.append(self.allocator, overflow.right);
+            const root = try self.writable(&self.root);
+            if (try self.insertInto(root, current_pos, piece)) |overflow| {
+                const new_root = try self.createInternal();
+                try new_root.children.ensureTotalCapacity(self.allocator, 2);
+                new_root.children.appendAssumeCapacity(overflow.left);
+                new_root.children.appendAssumeCapacity(overflow.right);
                 nodes.recomputeNode(.{ .internal = new_root });
                 self.root = .{ .internal = new_root };
             }
@@ -846,7 +1010,8 @@ pub const PieceTable = struct {
     }
 
     fn deleteAligned(self: *PieceTable, start: u32, end: u32) !void {
-        _ = try self.deleteFrom(self.root, start, end);
+        const root = try self.writable(&self.root);
+        _ = try self.deleteFrom(root, start, end);
         try self.normalizeRoot();
     }
 
@@ -917,8 +1082,9 @@ pub const PieceTable = struct {
         var new_children: std.ArrayListUnmanaged(nodes.NodeRef) = .empty;
         errdefer new_children.deinit(self.allocator);
 
+        // Removed children are not freed here: commit frees them, abort keeps them.
         var cursor: u32 = 0;
-        for (node.children.items) |child| {
+        for (node.children.items, 0..) |child, index| {
             const child_start = cursor;
             const child_end = cursor + child.summary().graphemes;
             cursor = child_end;
@@ -927,22 +1093,19 @@ pub const PieceTable = struct {
                 try new_children.append(self.allocator, child);
                 continue;
             }
+            if (start <= child_start and child_end <= end) continue;
 
-            if (start <= child_start and child_end <= end) {
-                freeNode(self.allocator, child);
-                continue;
-            }
-
-            const empty = try self.deleteFrom(child, @max(start, child_start) - child_start, @min(end, child_end) - child_start);
-            if (empty) {
-                freeNode(self.allocator, child);
-                continue;
-            }
-            try new_children.append(self.allocator, child);
+            const target = try self.writable(&node.children.items[index]);
+            const local_start = @max(start, child_start) - child_start;
+            const local_end = @min(end, child_end) - child_start;
+            if (try self.deleteFrom(target, local_start, local_end)) continue;
+            try new_children.append(self.allocator, target);
         }
 
         node.children.deinit(self.allocator);
         node.children = new_children;
+        // The node owns the list now; the errdefer above must not free it.
+        new_children = .empty;
         try self.repairUnderfullChildren(node);
         nodes.recomputeNode(.{ .internal = node });
         return node.children.items.len == 0;
@@ -980,13 +1143,13 @@ pub const PieceTable = struct {
             }
 
             if (index > 0 and nodeCanLend(parent.children.items[index - 1])) {
-                self.borrowFromLeftSibling(parent, index);
+                try self.borrowFromLeftSibling(parent, index);
                 index += 1;
                 continue;
             }
 
             if (index + 1 < parent.children.items.len and nodeCanLend(parent.children.items[index + 1])) {
-                self.borrowFromRightSibling(parent, index);
+                try self.borrowFromRightSibling(parent, index);
                 index += 1;
                 continue;
             }
@@ -1006,54 +1169,39 @@ pub const PieceTable = struct {
         }
     }
 
-    fn borrowFromLeftSibling(self: *PieceTable, parent: *nodes.Internal, index: usize) void {
-        const left = parent.children.items[index - 1];
-        const right = parent.children.items[index];
+    /// Moves the left sibling's last entry to the front of the child at `index`.
+    /// Both siblings change, so both are made writable first.
+    fn borrowFromLeftSibling(self: *PieceTable, parent: *nodes.Internal, index: usize) !void {
+        const left = try self.writable(&parent.children.items[index - 1]);
+        const right = try self.writable(&parent.children.items[index]);
         switch (left) {
-            .leaf => |left_leaf| switch (right) {
-                .leaf => |right_leaf| {
-                    const moved = left_leaf.pieces.pop().?;
-                    right_leaf.pieces.insert(self.allocator, 0, moved) catch unreachable;
-                    nodes.recomputeNode(left);
-                    nodes.recomputeNode(right);
-                },
-                .internal => unreachable,
+            .leaf => |left_leaf| {
+                try right.leaf.pieces.insert(self.allocator, 0, left_leaf.pieces.pop().?);
             },
-            .internal => |left_internal| switch (right) {
-                .internal => |right_internal| {
-                    const moved = left_internal.children.pop().?;
-                    right_internal.children.insert(self.allocator, 0, moved) catch unreachable;
-                    nodes.recomputeNode(left);
-                    nodes.recomputeNode(right);
-                },
-                .leaf => unreachable,
+            .internal => |left_internal| {
+                try right.internal.children.insert(self.allocator, 0, left_internal.children.pop().?);
             },
         }
+        nodes.recomputeNode(left);
+        nodes.recomputeNode(right);
     }
 
-    fn borrowFromRightSibling(self: *PieceTable, parent: *nodes.Internal, index: usize) void {
-        const left = parent.children.items[index];
-        const right = parent.children.items[index + 1];
-        switch (left) {
-            .leaf => |left_leaf| switch (right) {
-                .leaf => |right_leaf| {
-                    const moved = right_leaf.pieces.orderedRemove(0);
-                    left_leaf.pieces.append(self.allocator, moved) catch unreachable;
-                    nodes.recomputeNode(left);
-                    nodes.recomputeNode(right);
-                },
-                .internal => unreachable,
+    /// Moves the right sibling's first entry to the end of the child at `index`.
+    fn borrowFromRightSibling(self: *PieceTable, parent: *nodes.Internal, index: usize) !void {
+        const left = try self.writable(&parent.children.items[index]);
+        const right = try self.writable(&parent.children.items[index + 1]);
+        switch (right) {
+            .leaf => |right_leaf| {
+                const moved = right_leaf.pieces.orderedRemove(0);
+                try left.leaf.pieces.append(self.allocator, moved);
             },
-            .internal => |left_internal| switch (right) {
-                .internal => |right_internal| {
-                    const moved = right_internal.children.orderedRemove(0);
-                    left_internal.children.append(self.allocator, moved) catch unreachable;
-                    nodes.recomputeNode(left);
-                    nodes.recomputeNode(right);
-                },
-                .leaf => unreachable,
+            .internal => |right_internal| {
+                const moved = right_internal.children.orderedRemove(0);
+                try left.internal.children.append(self.allocator, moved);
             },
         }
+        nodes.recomputeNode(left);
+        nodes.recomputeNode(right);
     }
 
     fn mergeWithLeftSibling(
@@ -1061,9 +1209,8 @@ pub const PieceTable = struct {
         parent: *nodes.Internal,
         index: usize,
     ) PieceTableError!void {
-        const left = parent.children.items[index - 1];
-        const right = parent.children.items[index];
-        try self.mergeNodes(left, right);
+        const left = try self.writable(&parent.children.items[index - 1]);
+        try self.mergeNodes(left, parent.children.items[index]);
         _ = parent.children.orderedRemove(index);
         nodes.recomputeNode(left);
     }
@@ -1073,59 +1220,45 @@ pub const PieceTable = struct {
         parent: *nodes.Internal,
         index: usize,
     ) PieceTableError!void {
-        const left = parent.children.items[index];
-        const right = parent.children.items[index + 1];
-        try self.mergeNodes(left, right);
+        const left = try self.writable(&parent.children.items[index]);
+        try self.mergeNodes(left, parent.children.items[index + 1]);
         _ = parent.children.orderedRemove(index + 1);
         nodes.recomputeNode(left);
     }
 
+    /// Appends `right`'s entries to the writable `left`. `right` is only read; once its
+    /// parent drops it, commit frees it (or, if committed, frees what it no longer shares).
     fn mergeNodes(
         self: *PieceTable,
         left: nodes.NodeRef,
         right: nodes.NodeRef,
     ) PieceTableError!void {
         switch (left) {
-            .leaf => |left_leaf| switch (right) {
-                .leaf => |right_leaf| {
-                    try left_leaf.pieces.appendSlice(self.allocator, right_leaf.pieces.items);
-                    right_leaf.pieces.deinit(self.allocator);
-                    self.allocator.destroy(right_leaf);
-                },
-                .internal => unreachable,
+            .leaf => |left_leaf| {
+                try left_leaf.pieces.appendSlice(self.allocator, right.leaf.pieces.items);
             },
-            .internal => |left_internal| switch (right) {
-                .internal => |right_internal| {
-                    try left_internal.children.appendSlice(self.allocator, right_internal.children.items);
-                    right_internal.children.deinit(self.allocator);
-                    self.allocator.destroy(right_internal);
-                },
-                .leaf => unreachable,
+            .internal => |left_internal| {
+                try left_internal.children.appendSlice(self.allocator, right.internal.children.items);
             },
         }
     }
 
+    /// Collapses single-child roots. Dropped roots stay recorded for commit or abort.
     fn normalizeRoot(self: *PieceTable) PieceTableError!void {
         while (true) {
             switch (self.root) {
                 .leaf => return,
                 .internal => |internal| {
                     if (internal.children.items.len == 0) {
-                        internal.children.deinit(self.allocator);
-                        self.allocator.destroy(internal);
-                        const empty_leaf = try self.allocator.create(nodes.Leaf);
-                        empty_leaf.* = .{};
-                        self.root = .{ .leaf = empty_leaf };
+                        self.root = .{ .leaf = try self.createLeaf() };
                         return;
                     }
                     if (internal.children.items.len == 1) {
-                        const child = internal.children.items[0];
-                        internal.children.deinit(self.allocator);
-                        self.allocator.destroy(internal);
-                        self.root = child;
+                        self.root = internal.children.items[0];
                         continue;
                     }
-                    nodes.recomputeNode(self.root);
+                    // A committed root is unchanged, so its summary is already correct.
+                    if (internal.ownership.owned) nodes.recomputeNode(self.root);
                     return;
                 },
             }
@@ -1168,52 +1301,26 @@ pub const PieceTable = struct {
         };
     }
 
+    /// Splits a writable, overfull leaf in half. The leaf keeps the left half.
     fn splitLeaf(self: *PieceTable, node: *nodes.Leaf) !SplitNode {
         const mid = node.pieces.items.len / 2;
-
-        const left = try self.allocator.create(nodes.Leaf);
-        errdefer self.allocator.destroy(left);
-        left.* = .{};
-        try left.pieces.appendSlice(self.allocator, node.pieces.items[0..mid]);
-        nodes.recomputeNode(.{ .leaf = left });
-
-        const right = try self.allocator.create(nodes.Leaf);
-        errdefer {
-            left.pieces.deinit(self.allocator);
-            self.allocator.destroy(left);
-            self.allocator.destroy(right);
-        }
-        right.* = .{};
+        const right = try self.createLeaf();
         try right.pieces.appendSlice(self.allocator, node.pieces.items[mid..]);
+        node.pieces.shrinkRetainingCapacity(mid);
+        nodes.recomputeNode(.{ .leaf = node });
         nodes.recomputeNode(.{ .leaf = right });
-
-        node.pieces.deinit(self.allocator);
-        self.allocator.destroy(node);
-        return .{ .left = .{ .leaf = left }, .right = .{ .leaf = right } };
+        return .{ .left = .{ .leaf = node }, .right = .{ .leaf = right } };
     }
 
+    /// Splits a writable, overfull internal node in half. The node keeps the left half.
     fn splitInternal(self: *PieceTable, node: *nodes.Internal) !SplitNode {
         const mid = node.children.items.len / 2;
-
-        const left = try self.allocator.create(nodes.Internal);
-        errdefer self.allocator.destroy(left);
-        left.* = .{};
-        try left.children.appendSlice(self.allocator, node.children.items[0..mid]);
-        nodes.recomputeNode(.{ .internal = left });
-
-        const right = try self.allocator.create(nodes.Internal);
-        errdefer {
-            left.children.deinit(self.allocator);
-            self.allocator.destroy(left);
-            self.allocator.destroy(right);
-        }
-        right.* = .{};
+        const right = try self.createInternal();
         try right.children.appendSlice(self.allocator, node.children.items[mid..]);
+        node.children.shrinkRetainingCapacity(mid);
+        nodes.recomputeNode(.{ .internal = node });
         nodes.recomputeNode(.{ .internal = right });
-
-        node.children.deinit(self.allocator);
-        self.allocator.destroy(node);
-        return .{ .left = .{ .internal = left }, .right = .{ .internal = right } };
+        return .{ .left = .{ .internal = node }, .right = .{ .internal = right } };
     }
 
     fn positionAfterNewline(self: *const PieceTable, newline_number: u32) Error!u32 {
@@ -1436,6 +1543,28 @@ fn boundaryFrom(bytes: []const u8, from: usize, target: usize) Boundary {
     return .{ .found = false, .last = last };
 }
 
+/// Marks every node the candidate reaches. Committed nodes are marked but not entered:
+/// none of their descendants was written, so the whole subtree is shared.
+fn markReachable(node: nodes.NodeRef) void {
+    const ownership = node.ownership();
+    ownership.reachable = true;
+    if (!ownership.owned) return;
+    if (node == .internal) {
+        for (node.internal.children.items) |child| markReachable(child);
+    }
+}
+
+/// Clears transaction bookkeeping from the published tree; it is all committed now.
+fn settle(node: nodes.NodeRef) void {
+    const ownership = node.ownership();
+    const owned = ownership.owned;
+    ownership.* = .{};
+    if (!owned) return;
+    if (node == .internal) {
+        for (node.internal.children.items) |child| settle(child);
+    }
+}
+
 fn freeNode(allocator: std.mem.Allocator, node: nodes.NodeRef) void {
     switch (node) {
         .leaf => |n| {
@@ -1468,7 +1597,7 @@ fn buildTree(allocator: std.mem.Allocator, pieces: []const nodes.Piece) !nodes.N
         const end = @min(i + nodes.max_leaf_pieces, pieces.len);
         const leaf = try allocator.create(nodes.Leaf);
         leaf.* = .{};
-        errdefer allocator.destroy(leaf);
+        errdefer freeNode(allocator, .{ .leaf = leaf });
         try leaf.pieces.appendSlice(allocator, pieces[i..end]);
         nodes.recomputeNode(.{ .leaf = leaf });
         try level.append(allocator, .{ .leaf = leaf });
@@ -1477,8 +1606,9 @@ fn buildTree(allocator: std.mem.Allocator, pieces: []const nodes.Piece) !nodes.N
 
     while (level.items.len > 1) {
         var next_level: std.ArrayListUnmanaged(nodes.NodeRef) = .empty;
+        // Until the swap below, `level` owns the children: free these nodes shallowly.
         errdefer {
-            for (next_level.items) |n| freeNode(allocator, n);
+            for (next_level.items) |n| n.destroyShallow(allocator);
             next_level.deinit(allocator);
         }
         var j: usize = 0;
@@ -1486,7 +1616,7 @@ fn buildTree(allocator: std.mem.Allocator, pieces: []const nodes.Piece) !nodes.N
             const end = @min(j + nodes.max_internal_fanout, level.items.len);
             const node = try allocator.create(nodes.Internal);
             node.* = .{};
-            errdefer allocator.destroy(node);
+            errdefer (nodes.NodeRef{ .internal = node }).destroyShallow(allocator);
             try node.children.appendSlice(allocator, level.items[j..end]);
             nodes.recomputeNode(.{ .internal = node });
             try next_level.append(allocator, .{ .internal = node });

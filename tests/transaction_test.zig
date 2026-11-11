@@ -5,6 +5,7 @@ const litura = @import("litura");
 const BufferEngine = litura.BufferEngine;
 const types = litura.types;
 const allocator = std.testing.allocator;
+const State = @import("engine_state.zig").State;
 
 fn submit(engine: *BufferEngine, intent: types.Intent) !types.SubmitResult {
     return engine.submit(intent);
@@ -159,6 +160,26 @@ test "buffer edits, undo, redo and resurrection never advance interaction revisi
     defer redo.deinit(allocator);
     try std.testing.expectEqual(@as(?u32, 2), try position(&engine, cursor));
     try std.testing.expectEqual(revision, try engine.interactionRevision(session));
+}
+
+test "the declared Reject policy never interprets stale coordinates" {
+    var engine = try BufferEngine.initFromText(allocator, "ab", null);
+    defer engine.deinit();
+    try std.testing.expect(engine.queryCapabilities().rebase_policy == .reject);
+
+    // B observes "ab" at revision 0 and prepares to replace [1, 2), the "b".
+    const observed = engine.revision;
+    // A commits first, so [1, 2) now addresses "a".
+    try applyEdit(&engine, .{ .insert = .{ .pos = 0, .text = "X" } });
+    const replace_b = [_]types.BufferOp{.{ .replace = .{ .start = 1, .end = 2, .text = "c" } }};
+    var result = try engine.submit(.{
+        .origin = observed,
+        .payload = .{ .buffer_mutation = .{ .ops = &replace_b } },
+    });
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .validation_report);
+    try std.testing.expectEqual(types.ValidationVerdict.stale, result.validation_report.verdict);
+    try expectText(&engine, "Xab");
 }
 
 test "explicit interaction mutations advance the interaction revision once" {
@@ -343,8 +364,8 @@ test "edit reference rejections leave no effect" {
 }
 
 /// Fails exactly one allocation, the one after `remaining` successful allocations, then
-/// succeeds again. This models a transient failure: the transaction's own rollback can
-/// allocate. Persistent exhaustion during rollback is a known issue.
+/// succeeds again. This models a transient failure; persistent exhaustion is covered by
+/// allocation_failure_test.zig.
 const FailOnce = struct {
     inner: std.mem.Allocator,
     remaining: usize = std.math.maxInt(usize),
@@ -413,8 +434,7 @@ const Observed = struct {
 
 test "a transient allocation failure anywhere in a composite leaves no observable effect" {
     // Method: fail the nth allocation of one submission, for every n, until the
-    // submission succeeds; each failure must leave the observed state intact. The tree
-    // insertion window in PieceTable.applySplice is not exercised by this payload.
+    // submission succeeds; each failure must leave the observed state intact.
     var fail_after: usize = 0;
     while (true) : (fail_after += 1) {
         var failing: FailOnce = .{ .inner = allocator };
@@ -475,10 +495,6 @@ test "a transient allocation failure anywhere in a composite leaves no observabl
 test "a transient allocation failure during undo or redo leaves no observable effect" {
     // Method: as above, for an undo that restores a joining deletion and resurrects an
     // anchor, then for the redo that deletes it again.
-    // Skipped: a failure while inserting pieces into the tree after the old range was
-    // removed loses that range (PieceTable.applySplice, docs/known-issues.md). This test
-    // is the regression check for that fix.
-    if (true) return error.SkipZigTest;
     for ([_]bool{ false, true }) |redo| {
         var fail_after: usize = 0;
         while (true) : (fail_after += 1) {
@@ -521,4 +537,24 @@ test "a transient allocation failure during undo or redo leaves no observable ef
             break;
         }
     }
+}
+
+test "an undo whose anchor resurrection fails has no effect" {
+    var engine = try BufferEngine.initFromText(allocator, "abcde", null);
+    defer engine.deinit();
+    var provider = litura.views.StaticTokenProvider{ .spans = &.{} };
+    try engine.registerViewProvider(provider.provider());
+    _ = try engine.createAnchor(2, .weak);
+    try applyEdit(&engine, .{ .delete = .{ .start = 1, .end = 4 } });
+    // Break the lineage: resurrection needs the deletion's hidden target anchor.
+    try engine.dropAnchor(engine.undo_stack.items[0].deletion_metas[0].target_anchor);
+    provider.stale = false;
+    var before = try State.capture(allocator, &engine, &provider);
+    defer before.deinit();
+
+    try std.testing.expectError(error.KeyError, engine.submit(.{ .payload = .{ .undo = .{} } }));
+    var after = try State.capture(allocator, &engine, &provider);
+    defer after.deinit();
+    try State.expectEqual(&before, &after);
+    try std.testing.expect(engine.canUndo());
 }

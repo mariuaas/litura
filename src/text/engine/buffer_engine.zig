@@ -58,6 +58,8 @@ pub const BufferEngine = struct {
     redo_stack: std.ArrayListUnmanaged(types.UndoEntry) = .empty,
 
     view_providers: std.StringHashMapUnmanaged(views.ViewProvider) = .empty,
+    /// Set while view providers are being notified; mutation is rejected meanwhile.
+    notifying: bool = false,
     capability_supported_views_storage: [10][]const u8 = undefined,
 
     const MutationCommit = struct {
@@ -72,6 +74,10 @@ pub const BufferEngine = struct {
     };
 
     const Splice = piece_table.PieceTable.Splice;
+
+    /// Providers already notified of an event. Reserved before publication, so
+    /// notifying cannot fail after it.
+    const ProviderSet = std.AutoHashMapUnmanaged(usize, void);
 
     /// Every buffer operation is a replacement of [start, end) with text.
     const RequestedEdit = struct {
@@ -396,13 +402,13 @@ pub const BufferEngine = struct {
         };
     }
 
-    /// Notifies each distinct provider once. `seen` must be empty with capacity for every
-    /// registered provider, so notification cannot fail after a revision is committed.
-    fn notifyViewProviders(
-        self: *BufferEngine,
-        event: *const types.EditEvent,
-        seen: *std.AutoHashMapUnmanaged(usize, void),
-    ) void {
+    /// Notifies each distinct provider once, as the last step of a submission, after
+    /// every part of it (including a composite's interaction part) is published. `seen`
+    /// must be empty with capacity for every registered provider. A provider that tries
+    /// to mutate the engine from its callback is refused with error.ReentrantMutation.
+    fn notifyViewProviders(self: *BufferEngine, event: *const types.EditEvent, seen: *ProviderSet) void {
+        self.notifying = true;
+        defer self.notifying = false;
         var iter = self.view_providers.valueIterator();
         while (iter.next()) |provider| {
             const identity = @intFromPtr(provider.ptr);
@@ -413,9 +419,11 @@ pub const BufferEngine = struct {
     }
 
     /// Validates origins and guards, then applies the intent synchronously.
-    /// Rejections are owning validation reports and leave no observable effect. Some
-    /// allocation failures are not fully transactional (docs/known-issues.md).
+    /// Rejections are owning validation reports and leave no observable effect, as do
+    /// errors, including allocation failure. Returns error.ReentrantMutation when called
+    /// from a view provider's notification.
     pub fn submit(self: *BufferEngine, intent: types.Intent) !types.SubmitResult {
+        if (self.notifying) return error.ReentrantMutation;
         switch (intent.payload) {
             .buffer_mutation => |payload| {
                 if (try validation.validationReportForStaleBufferOrigin(self, intent)) |report| {
@@ -428,14 +436,18 @@ pub const BufferEngine = struct {
                     .applied => |applied| applied,
                     .rejected => |message| return self.invalidReport(intent, message),
                 };
+                var providers: ProviderSet = .empty;
+                defer providers.deinit(self.allocator);
                 const event = try self.finishCommit(
                     &pending,
                     payload.ops,
                     intent.source,
                     intent.cause,
                     &self.undo_stack,
+                    &providers,
                 );
                 self.discardRedo();
+                self.notifyViewProviders(&event, &providers);
                 return .{ .edit_event = event };
             },
             .interaction_mutation => |payload| {
@@ -472,14 +484,18 @@ pub const BufferEngine = struct {
                 // Popping keeps the capacity that restoring the entry on failure needs.
                 var original = self.undo_stack.pop().?;
                 errdefer self.undo_stack.appendAssumeCapacity(original);
+                var providers: ProviderSet = .empty;
+                defer providers.deinit(self.allocator);
                 const event = try self.applyOpsCommitted(
                     original.inverse_ops,
                     intent.source,
                     intent.cause,
                     &self.redo_stack,
+                    original.deletion_metas,
+                    &providers,
                 );
-                try self.resurrectDeletionMetas(original.deletion_metas);
                 original.deinit(self.allocator);
+                self.notifyViewProviders(&event, &providers);
                 return .{ .edit_event = event };
             },
             .redo => {
@@ -496,14 +512,18 @@ pub const BufferEngine = struct {
                 // Popping keeps the capacity that restoring the entry on failure needs.
                 var original = self.redo_stack.pop().?;
                 errdefer self.redo_stack.appendAssumeCapacity(original);
+                var providers: ProviderSet = .empty;
+                defer providers.deinit(self.allocator);
                 const event = try self.applyOpsCommitted(
                     original.inverse_ops,
                     intent.source,
                     intent.cause,
                     &self.undo_stack,
+                    original.deletion_metas,
+                    &providers,
                 );
-                try self.resurrectDeletionMetas(original.deletion_metas);
                 original.deinit(self.allocator);
+                self.notifyViewProviders(&event, &providers);
                 return .{ .edit_event = event };
             },
         }
@@ -562,6 +582,8 @@ pub const BufferEngine = struct {
 
         // Applying the interactions must not fail after the commit: reserve their anchors.
         try self.anchors_map.ensureUnusedCapacity(self.allocator, markCount(resolved));
+        var providers: ProviderSet = .empty;
+        defer providers.deinit(self.allocator);
         var event: ?types.EditEvent = null;
         if (pending) |applied| {
             var owned = applied;
@@ -572,6 +594,7 @@ pub const BufferEngine = struct {
                 intent.source,
                 intent.cause,
                 &self.undo_stack,
+                &providers,
             );
             self.discardRedo();
         }
@@ -581,7 +604,11 @@ pub const BufferEngine = struct {
             interaction_result = try self.applyInteractionMutation(interaction);
         }
 
-        if (event) |edit_event| return .{ .edit_event = edit_event };
+        if (event) |*edit_event| {
+            // The composite is complete: providers see the edit and the interaction together.
+            self.notifyViewProviders(edit_event, &providers);
+            return .{ .edit_event = edit_event.* };
+        }
         return .{ .interaction_result = interaction_result.? };
     }
 
@@ -1190,9 +1217,13 @@ pub const BufferEngine = struct {
         source: []const u8,
         cause: []const u8,
     ) !void {
-        var event = try self.applyOpsCommitted(ops, source, cause, &self.undo_stack);
-        event.deinit(self.allocator);
+        if (self.notifying) return error.ReentrantMutation;
+        var providers: ProviderSet = .empty;
+        defer providers.deinit(self.allocator);
+        var event = try self.applyOpsCommitted(ops, source, cause, &self.undo_stack, &.{}, &providers);
+        defer event.deinit(self.allocator);
         self.discardRedo();
+        self.notifyViewProviders(&event, &providers);
     }
 
     fn editClass(ops: []const types.BufferOp) []const u8 {
@@ -1228,6 +1259,7 @@ pub const BufferEngine = struct {
         var pending: PendingMutation = .{
             .anchors_before = try self.anchors_map.clone(self.allocator),
         };
+        self.table.begin();
         errdefer self.rollbackPending(&pending);
         for (ops, 0..) |op, index| {
             const result_anchors = if (edits) |slice| &slice[index] else null;
@@ -1307,19 +1339,11 @@ pub const BufferEngine = struct {
         };
     }
 
-    /// Restores the text through the recorded inverses and the anchors from the snapshot.
-    /// Each inverse realizes an aligned splice on the state its operation produced, so the
-    /// text is restored exactly. Anchor ids consumed by rolled-back hidden anchors are not
-    /// reused. Allocation failure here leaves the document inconsistent (known issue).
+    /// Discards the candidate tree and restores the anchors from the snapshot. Neither
+    /// step allocates, so rollback succeeds even when the allocator is exhausted. Anchor
+    /// ids consumed by rolled-back hidden anchors are not reused.
     fn rollbackPending(self: *BufferEngine, pending: *PendingMutation) void {
-        var index = pending.inverse_ops.items.len;
-        while (index > 0) {
-            index -= 1;
-            const edit = requestedEdit(pending.inverse_ops.items[index]);
-            self.table.replace(edit.start, edit.end, edit.text) catch |err| {
-                log.err("rolling back a rejected mutation: {s}", .{@errorName(err)});
-            };
-        }
+        self.table.abort();
         std.mem.swap(
             std.AutoHashMapUnmanaged(u32, anchors.Anchor),
             &self.anchors_map,
@@ -1357,12 +1381,14 @@ pub const BufferEngine = struct {
             }
             self.allocator.free(deletion_metas);
         };
-        // Last fallible step: rollback needs the inverses until here.
+        // Last fallible step: afterwards pending no longer owns the inverses.
         const inverse_ops = try pending.inverse_ops.toOwnedSlice(self.allocator);
         std.mem.reverse(types.BufferOp, inverse_ops);
         pending.anchors_before.deinit(self.allocator);
         pending.* = undefined;
 
+        // Publication: nothing below allocates or fails.
+        self.table.commit();
         const old_revision = self.revision;
         self.revision += 1;
         forward_revs[0] = self.revision;
@@ -1391,6 +1417,8 @@ pub const BufferEngine = struct {
         source: []const u8,
         cause: []const u8,
         history: *std.ArrayListUnmanaged(types.UndoEntry),
+        resurrect: []const types.DeletionMeta,
+        providers: *ProviderSet,
     ) !types.EditEvent {
         var pending = switch (try self.applyOpsPending(ops, null)) {
             .applied => |applied| applied,
@@ -1400,12 +1428,19 @@ pub const BufferEngine = struct {
                 return error.InvalidArgument;
             },
         };
-        return self.finishCommit(&pending, ops, source, cause, history);
+        // Resurrection only changes anchors, which rollback restores, so it belongs
+        // before publication: if it fails, the undo or redo has no effect.
+        self.resurrectDeletionMetas(resurrect) catch |err| {
+            self.rollbackPending(&pending);
+            return err;
+        };
+        return self.finishCommit(&pending, ops, source, cause, history, providers);
     }
 
-    /// Commits applied operations as one revision, records the undo entry on `history`
-    /// and notifies view providers. Everything that can fail is reserved first, so an
-    /// error rolls the mutation back and nothing after the commit can fail.
+    /// Commits applied operations as one revision and records the undo entry on
+    /// `history`. Everything that can fail is reserved first, including `providers` for
+    /// the caller's notification, so an error rolls the mutation back and nothing after
+    /// the commit can fail. The caller notifies providers once the submission is complete.
     fn finishCommit(
         self: *BufferEngine,
         pending: *PendingMutation,
@@ -1413,23 +1448,21 @@ pub const BufferEngine = struct {
         source: []const u8,
         cause: []const u8,
         history: *std.ArrayListUnmanaged(types.UndoEntry),
+        providers: *ProviderSet,
     ) !types.EditEvent {
-        var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
-        defer seen.deinit(self.allocator);
-        self.reserveCommit(history, &seen) catch |err| {
+        self.reserveCommit(history, providers) catch |err| {
             self.rollbackPending(pending);
             return err;
         };
         const commit = try self.commitPending(pending, ops, source, cause);
         history.appendAssumeCapacity(commit.undo_entry);
-        self.notifyViewProviders(&commit.event, &seen);
         return commit.event;
     }
 
     fn reserveCommit(
         self: *BufferEngine,
         history: *std.ArrayListUnmanaged(types.UndoEntry),
-        seen: *std.AutoHashMapUnmanaged(usize, void),
+        seen: *ProviderSet,
     ) !void {
         try history.ensureUnusedCapacity(self.allocator, 1);
         try seen.ensureTotalCapacity(self.allocator, @intCast(self.view_providers.count()));

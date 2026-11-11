@@ -5,6 +5,9 @@ comptime {
     _ = @import("grapheme_boundary_test.zig");
     _ = @import("segmentation_locality_test.zig");
     _ = @import("transaction_test.zig");
+    _ = @import("allocation_failure_test.zig");
+    _ = @import("tree_transaction_test.zig");
+    _ = @import("provider_notification_test.zig");
     _ = @import("evaluation_test.zig");
     _ = @import("providers_test.zig");
     _ = @import("piece_table_test.zig");

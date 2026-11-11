@@ -425,7 +425,9 @@ drop_anchor(buffer, anchor_id) -> ()
 If the requested position was deleted between `origin_revision` and
 `head_revision`, the engine returns a valid `AnchorId` initialized with `status:
 Dead`. The extension discovers this through the receipt and can decide whether
-to re-evaluate.
+to re-evaluate. Rebasing the position from `origin_revision` follows the
+engine's rebase policy (§6.2); a request the policy cannot interpret is
+rejected without creating an anchor.
 
 A `Dead` anchor may not be used as a mutation target. It may be queried (returns
 `Dead` status).
@@ -867,6 +869,7 @@ EngineCapabilities = {
     supported_group_modes : GroupModeSet
     apply_policies        : ApplyPolicySet
     program_carriers      : ProgramCarrierProfile[]
+    rebase_policy         : RebasePolicy      -- §6.2
     limits                : EngineLimits
 }
 
@@ -907,8 +910,9 @@ must be `"CanonicalAWU"`, indicating compatibility with the abstract cost model
 defined in §5.3.
 
 **Normative constraint:** `supported_views`, `summary_registry`,
-`supported_group_modes`, `apply_policies`, and `program_carriers` together
-define the complete protocol-visible optional feature surface of the engine. A
+`supported_group_modes`, `apply_policies`, `program_carriers`, and
+`rebase_policy` together define the complete protocol-visible optional feature
+surface of the engine. A
 client must not be required to infer support for any optional feature through
 failed speculative requests alone.
 
@@ -1144,9 +1148,9 @@ interaction revision.
 **Normative constraint (coordinates in interaction requests):** An interaction
 operation that carries a `Position` is coordinate-bearing. It is valid only at
 the buffer revision it was computed against: the engine validates the intent's
-`origin.buffer_revision` and either rebases the position (§6.2) or rejects the
-intent as `Stale { reason: BufferAdvanced }`. An interaction CAS match alone
-does not make a position current, because buffer edits do not advance the
+`origin.buffer_revision` and, according to its rebase policy (§6.2), either
+rebases the position or rejects the intent as `Stale`. An interaction CAS match
+alone does not make a position current, because buffer edits do not advance the
 interaction revision. Operations that refer only to `AnchorId`s are
 anchor-scoped and follow anchor liveness and guard semantics instead.
 
@@ -1333,9 +1337,11 @@ CoreContentGuard =
   iterating the underlying piece-table spans and feeding each chunk into the
   hash state. Engines must not require intermediate contiguous memory allocation
   to evaluate the hash.
-- **Evaluation order:** The guarded range must be rebased to head revision
-  before hashing. The hash is always computed against the current logical text
-  at head, not against stale coordinates.
+- **Evaluation order:** The hash is always computed against the current logical
+  text at head, never against stale coordinates. When the intent's origin is
+  behind head, the guarded range is first rebased according to the engine's
+  rebase policy (§6.2); under `Reject`, the intent is rejected as `Stale`
+  before any guard is evaluated.
 - **Posture:** `SliceHash` is a bounded, probabilistic guard for detecting
   accidental coordinate skew or concurrent mutation. It is strictly
   non-cryptographic.
@@ -1632,11 +1638,16 @@ Verdict =
 
 StaleReason =
     | BufferAdvanced      { origin: Revision, head: Revision }
+    | OriginUnavailable   { origin: Revision, oldest: Revision, head: Revision }
     | InteractionAdvanced { 
         origin: InteractionRevision, 
         head: InteractionRevision 
     }
 ```
+
+`OriginUnavailable` is specific to engines with a `Rebase` policy (§6.2): the
+origin is older than the history the engine retains, so its coordinates cannot
+be interpreted at all.
 
 **Normative constraint:** `Verdict` is a projection over `per_guard`, not an
 independent computation. An engine must not produce a verdict that contradicts
@@ -1759,12 +1770,15 @@ requests are never exposed externally.
 **Fulfillment semantics:** Anchor positions are computed against the
 evaluation's declared revision. Fulfillment occurs at delivery time against
 current head. If the buffer has advanced between evaluation and delivery, the
-engine rebases the requested position from the evaluation revision to head. This
-rebasing must strictly apply the geometric rebasing algebra (`T_ins`, `T_del`)
-defined in §1.4 — it is a rigid mathematical transform, not a best-effort
-approximation. If rebasing fails (the position was deleted), the receipt is
-returned with `status: Dead`, consistent with `create_anchor` born-dead
-semantics.
+engine rebases the requested position from the evaluation revision to head,
+within its rebase policy (§6.2). This rebasing must strictly apply the
+geometric rebasing algebra (`T_ins`, `T_del`) and projection defined in §1.4 —
+it is a rigid mathematical transform, not a best-effort approximation. If the
+position was deleted, the receipt is returned with `status: Dead`, consistent
+with `create_anchor` born-dead semantics. If the policy cannot interpret the
+evaluation revision, the request is not fulfilled and the response reports the
+revision as unavailable. An engine with a `Reject` policy can avoid this case
+entirely by fulfilling anchor requests before head advances.
 
 **Tier 3: Intent synthesis.** An `EvalResponse` of tier `Result` may contain an
 `Intent` as its value. The engine applies it through the standard
@@ -1974,17 +1988,62 @@ better.
 
 ### 6.2 Coordinate Rebasing for Application
 
-When an intent's `origin` revision is behind head:
+An intent's coordinates describe the document at its origin revision. When the
+origin is behind head, the revisions in between may have moved, merged or
+deleted the text those coordinates address. Interpreting them anyway requires
+the realized splices of every intervening revision (§1.4), and how much of that
+history an engine keeps is an engineering choice. The protocol therefore does
+not promise rebasing. Each engine declares one policy through capability
+discovery (§2.1):
 
-- `Positional` intents: coordinates are rebased using the edit history
-  `origin..head`.
-- `AnchorScoped` intents: anchor positions are already maintained at head. No
-  rebasing needed.
-- `StructureGuarded` / `ContentGuarded` / `ViewGuarded` intents: coordinates
-  are rebased, then guards are evaluated at head.
+```
+RebasePolicy =
+    | Reject                    -- stale coordinates are never interpreted
+    | Rebase { window: nat }    -- interpreted across at most `window` revisions
+```
 
-Rebasing failure (ambiguous offset mapping) produces `Stale { reason:
-BufferAdvanced { origin, head } }` verdict.
+The policy governs coordinate-bearing intents: `Positional` intents, guarded
+intents whose targets or guards carry positions, and interaction operations
+that carry positions (§2.6). `AnchorScoped` intents need no rebasing, since
+anchor positions are maintained at head. `EditRef` targets (§2.6.1) name a
+result of the transaction itself and are unaffected.
+
+Under `Reject`, a coordinate-bearing intent whose origin is behind head is
+rejected with `Stale { reason: BufferAdvanced { origin, head } }`. Nothing is
+rebased, retried or interpreted at head. The client observes the new head and
+decides again.
+
+Under `Rebase { window }`, the engine rebases the intent's coordinates through
+the realized splices of revisions `origin+1..head` with the algebra and
+projection of §1.4, then evaluates guards at head:
+
+- Insertion points and range starts rebase as Sticky anchors; range ends rebase
+  as Weak anchors. An empty range rebases as one insertion point, so its ends
+  cannot cross. A rebased range never absorbs text that another revision
+  inserted exactly at its boundaries, and a rebased insertion lands after text
+  committed earlier at the same position, consistent with §1.4 tie-breaking.
+- If a coordinate lies strictly inside text deleted by an intervening revision,
+  the intent is rejected with `Stale { reason: BufferAdvanced }`. The position
+  the client observed no longer exists. Deletions strictly inside a target
+  range shrink it without rejection; an intent that must fail whenever its
+  target changed should carry a content guard (§3.1), which is evaluated at
+  head.
+- If `head - origin > window`, or the engine no longer retains the realized
+  splices of some revision in `origin+1..head`, the intent is rejected with
+  `Stale { reason: OriginUnavailable { origin, oldest, head } }`. `oldest` is
+  the oldest origin the engine can still rebase from. The engine must not
+  rebase partially, substitute a different origin, or interpret the coordinates
+  at head.
+
+Anchor creation from an earlier revision (§1.4 *Anchor Lifecycle*, §5.1 anchor
+requests) depends on the same history and follows the same policy. A position
+the policy cannot interpret is rejected rather than reported as a `Dead`
+anchor; `Dead` remains reserved for positions that were deleted.
+
+Rebasing is deterministic: the same intent, origin and history produce the same
+coordinates. Under either policy, a client can rely on stale coordinates never
+being applied to text it did not observe. Under `Rebase`, it can additionally
+rely on interpretation within the advertised window.
 
 ### 6.3 Non-Requirement
 
@@ -2795,20 +2854,77 @@ Items deferred from this draft, required before stabilization:
     acknowledgment, and queue reconciliation (§7.1, §7.2). Distributed merge
     semantics (e.g., peer-to-peer CRDTs or multi-user operational
     transformation) remain deferred as an external coordination layer.
-11. **Coordinate rebasing across revisions**: open. This is distinct from
-    positioning within one transaction, which `EditRef` resolves (§2.6.1). The
-    open problem is interpreting a request computed at revision `r` after
-    revisions `r+1..head` have been committed, by another client, an extension
-    or the same client's in-flight intents. Grapheme coordinates are not
-    additive (§1.3), so rebasing a position across a committed edit requires
-    the realized splice, the requested range, and enough text to project
-    (§1.4). `affected_ranges` alone is insufficient for §6.2 positional
-    rebasing and §7.2 client reconciliation. A client that rebases
-    speculatively must also segment with the same profile as the engine.
-    Candidate mechanisms: the engine retains splice history for a bounded
-    window and rebases or rejects (`Stale`) server-side; `EditEvent` carries
-    realized splices for client-side rebasing; and `EngineCapabilities`
-    advertises the segmentation profile (for example
-    `"UAX29-extended/16.0.0"`). Until resolved, engines may reject stale
-    positional intents. Changing the profile of an existing buffer is a
-    coordinate migration, not an edit, and is unspecified.
+11. **Coordinate rebasing across revisions**: partially resolved. This is
+    distinct from positioning within one transaction, which `EditRef` resolves
+    (§2.6.1). §6.2 now fixes the observable contract: an engine declares
+    `Reject` or `Rebase { window }`, and a bounded engine rejects an origin
+    outside its retained history with `OriginUnavailable` rather than
+    interpreting it partially or at head. The reference implementation
+    declares `Reject`.
+
+    What remains open is the machinery behind `Rebase`. Grapheme coordinates
+    are not additive (§1.3), so an engine rebasing a position needs the
+    realized splice of every retained revision and enough text to project
+    positions that fall inside rewritten context (§1.4). A client that rebases
+    its own speculative queue (§7.2) needs the same information, and must also
+    segment with the engine's profile. `affected_ranges` supports neither.
+    Candidate mechanisms are retained splice history with an origin-to-head
+    projection query, realized splices in event blocks (item 12), and a
+    segmentation-profile capability (for example `"UAX29-extended/16.0.0"`).
+    Changing the profile of an existing buffer is a coordinate migration, not
+    an edit, and is unspecified.
+12. **Canonical event production**: open; direction agreed. §7 currently
+    describes two things at once: what an engine reports about a committed
+    transition, and how those reports reach subscribers. They have different
+    owners. Only the engine knows exactly what committed, in what order, and
+    how interaction state changed. How long anyone keeps that record, and who
+    receives it, depends on the consumer: a host may keep the last thousand
+    blocks, forward each one immediately, or record them indefinitely for
+    reproducibility. The engine should not need to know which. The intended
+    split:
+
+    - *Production* belongs to the engine. Every committed transition yields
+      one owned canonical event block, returned from the call that commits
+      it. The engine numbers blocks from a gapless per-buffer sequence;
+      rejected intents consume no number. Since the sequence has no gaps, a
+      consumer can verify that it has seen every block without the engine
+      retaining any of them. Once a block is returned, the engine keeps no
+      delivery state.
+    - *Delivery* belongs to the host: retention, fan-out, coalescing and
+      lagging subscribers are hosting profiles. A host that pairs a snapshot
+      at sequence `N` with blocks `N+1` onward must capture both in one
+      serialized step; otherwise a block can commit between the snapshot and
+      the start of observation.
+
+    Decisions recorded with that split:
+
+    - Every protocol-visible state mutation enters through one authoritative
+      submission path. Direct mutators that bypass it, such as applying
+      buffer operations or changing session cursors and marks outside
+      `submit`, are the privileged pathways §0.1 rules out. They are routed
+      through submission rather than taught to produce events individually.
+    - A transaction is not published as committed until its event block is
+      complete and every failure-prone preparation has succeeded. A failure
+      during preparation restores the previous state. This is the payload
+      atomicity of §4.1 extended to event construction, and it depends on the
+      same allocation-failure work.
+    - Causal observability and replay are separate capabilities. A causal
+      block carries the sequence number, revisions, intent identity and
+      provenance, realized splices and explicit interaction changes. That
+      supports audit and invalidation, and its size does not grow with the
+      inserted text. A replay-capable block additionally carries enough
+      content to reconstruct the next document state. Whether that content is
+      copied or referenced in the engine's append-only stores is open: a
+      reference avoids duplicating a 50 MB insertion, but ties the event's
+      lifetime to the store's.
+    - A block contains an interaction event only for an explicit interaction
+      mutation (§2.6). Its old and new values are stated against the document
+      revision they address, not only the interaction revision. Passive
+      cursor movement caused by another transaction is explained by that
+      transaction's document event and is never reported as an interaction
+      event. A consumer that tracks another session's positions therefore
+      needs replay-capable content or an engine query.
+
+    Still open: the block's concrete shape, intent identity (`IntentId`,
+    §4.2), the representation of replay content, and how view providers
+    receive blocks.

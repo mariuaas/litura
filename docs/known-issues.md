@@ -4,16 +4,13 @@ The v0.1 specification is authoritative but remains a draft. These implementatio
 
 ## Allocation failure and transactions
 
-`BufferEngine.initFromText` lacks cleanup after creating the engine if text initialization or path copying fails. `PieceTable.initFromText` destroys the old tree before allocating its replacement. Constructors and reinitialization need allocation-failure tests and defined cleanup/recovery before callers can rely on failure preserving a valid prior value.
+Buffer operations are applied provisionally and committed only after the whole payload, and for composites its interaction positions, validate against the realized text. The piece table runs each payload as a transaction: committed tree nodes are copied on first write and never written, so rollback discards the candidate tree and restores the anchor snapshot without allocating, even under persistent allocator exhaustion. Everything that can fail after the commit (the history slot, the provider notification set, anchors for marks, undo's anchor resurrection) happens before it. Injection tests in `tests/allocation_failure_test.zig` and `tests/transaction_test.zig` cover transient and persistent failures, including node splits, merges and undo/redo. `PieceTable.initFromText` builds a replacement tree before releasing the current one. The design is recorded in [the atomicity study](development/piece-tree-atomicity-study.md).
 
-Buffer operations are applied provisionally and committed only after the whole payload, and for composites its interaction positions, validate against the realized text. Rejections roll back through the recorded inverses and an anchor snapshot. Everything that can fail after the commit (the history slot, the provider notification set, anchors for marks) is reserved before it, and transient allocation failures anywhere in a composite are covered by an injection test. Allocation failure is still not fully transactional:
-
-- `PieceTable.applySplice` prepares the add buffer and pieces before removing the old range, but inserting pieces into the tree allocates afterwards. A failure there loses the old range. Tree insertion needs to reserve node capacity, including splits, before it mutates; the skipped undo/redo injection test in `tests/transaction_test.zig` checks that fix.
-- Rollback replays inverses through the piece table, which allocates. Under persistent exhaustion it logs and leaves the document inconsistent.
+`BufferEngine.initFromText` still lacks cleanup after creating the engine if text initialization or path copying fails, so a failing constructor leaks the partly built engine.
 
 An intent without a document origin is treated as computed at head. Litura therefore checks position-bearing interaction requests against their document origin only when one is supplied.
 
-Undo/redo error recovery discards allocation failures while restoring history entries. Provider destruction also allocates a temporary identity set and discards insertion failures, risking repeated destruction of shared provider state under memory pressure. Tree rebalancing has `catch unreachable` on list operations without a documented local capacity proof; that capacity invariant needs verification. These error paths require correctness work, not replacement with different unchecked failure handling during a style pass.
+Provider destruction allocates a temporary identity set and discards insertion failures, risking repeated destruction of shared provider state under memory pressure. This error path needs correctness work, not replacement with different unchecked failure handling during a style pass.
 
 zg 0.16.2's `Graphemes.Iterator` sums cluster length in a `u8`, so a grapheme longer than 255 bytes panics in safe builds and is mismeasured otherwise. `text_segmentation.Iterator` drives zg's `graphemeBreak` with a full-width length instead; remove it once upstream is fixed.
 

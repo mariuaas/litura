@@ -213,6 +213,12 @@ pub const ViewProvider = struct {
         return self.vtable.refreshFn(self.ptr, engine);
     }
 
+    /// Tells the provider that a submission has been published, once per distinct
+    /// provider and after every part of the submission, including a composite's
+    /// interaction part. The event is borrowed for the call. Notification cannot fail,
+    /// so work that can (reparsing, for instance) belongs in `refresh`; a provider that
+    /// cannot keep up reports a stale state instead. The provider may read the engine but
+    /// must not mutate it: `submit` and `applyOps` return error.ReentrantMutation here.
     pub fn onBufferEvent(self: ViewProvider, engine: *anyopaque, event: *anyopaque) void {
         self.vtable.onBufferEventFn(self.ptr, engine, event);
     }
