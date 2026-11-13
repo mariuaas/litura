@@ -4,6 +4,7 @@ const options = @import("build_options");
 pub const engine = @import("text/engine/buffer_engine.zig");
 pub const BufferEngine = engine.BufferEngine;
 pub const types = @import("text/engine/buffer_types.zig");
+pub const events = @import("text/engine/events.zig");
 pub const anchors = @import("text/engine/anchors.zig");
 pub const queries = @import("text/engine/queries.zig");
 pub const views = @import("text/engine/views.zig");

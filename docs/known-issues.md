@@ -4,28 +4,30 @@ The v0.1 specification is authoritative but remains a draft. These implementatio
 
 ## Allocation failure and transactions
 
-Buffer operations are applied provisionally and committed only after the whole payload, and for composites its interaction positions, validate against the realized text. The piece table runs each payload as a transaction: committed tree nodes are copied on first write and never written, so rollback discards the candidate tree and restores the anchor snapshot without allocating, even under persistent allocator exhaustion. Everything that can fail after the commit (the history slot, the provider notification set, anchors for marks, undo's anchor resurrection) happens before it. Injection tests in `tests/allocation_failure_test.zig` and `tests/transaction_test.zig` cover transient and persistent failures, including node splits, merges and undo/redo. `PieceTable.initFromText` builds a replacement tree before releasing the current one. The design is recorded in [the atomicity study](development/piece-tree-atomicity-study.md).
+Buffer operations are applied provisionally and committed only after the whole payload, and for composites its interaction mutations, validate against the realized text. The piece table runs each payload as a transaction: committed tree nodes are copied on first write and never written, so rollback discards the candidate tree and restores the anchor snapshot without allocating, even under persistent allocator exhaustion. Interaction mutations and session creation are prepared in an overlay with provisional identities. Everything that can fail (the history slot, anchor and session capacity, undo's resurrection, the owned block) happens before publication, and publication, abandonment and provider notification do not allocate. Injection tests in `tests/allocation_failure_test.zig` and `tests/transaction_test.zig` cover transient and persistent failures, including node splits, merges, undo/redo, interaction-only and composite transitions with new endpoints, and session creation; the state comparator includes the identity boundaries and the sequence. `PieceTable.initFromText` builds a replacement tree before releasing the current one. The design is recorded in [the atomicity study](development/piece-tree-atomicity-study.md).
 
-`BufferEngine.initFromText` still lacks cleanup after creating the engine if text initialization or path copying fails, so a failing constructor leaks the partly built engine.
+## Differences from the specification
 
-An intent without a document origin is treated as computed at head. Litura therefore checks position-bearing interaction requests against their document origin only when one is supplied.
+Every intent and session creation states its document origin, and every interaction mutation its interaction origin; the types have no default, so no request obtains head-relative semantics by omission. Litura carries the interaction origin on each interaction mutation rather than once per intent, which allows a composite to change several sessions; for one session the two are equivalent.
 
-Provider destruction allocates a temporary identity set and discards insertion failures, risking repeated destruction of shared provider state under memory pressure. This error path needs correctness work, not replacement with different unchecked failure handling during a style pass.
+The points where SPEC §4.2 and Litura once differed are settled in the specification: undo and redo carry no session in v0.1, `priority` applies only to engines that report `Queued` sequencing (Litura reports `Synchronous`), and intrinsic requests fail with typed errors (`BufferEngine.RequestError`), not validation reports (§2.6.3).
 
 zg 0.16.2's `Graphemes.Iterator` sums cluster length in a `u8`, so a grapheme longer than 255 bytes panics in safe builds and is mismeasured otherwise. `text_segmentation.Iterator` drives zg's `graphemeBreak` with a full-width length instead; remove it once upstream is fixed.
 
-## Interaction and provider revisions
+## Costs
 
-`moveAnchor` checks only that an anchor exists. It accepts out-of-bounds positions and does not increment session interaction revisions, although moving a session cursor explicitly is an interaction mutation (SPEC §2.6). Higher-level interaction intents validate positions and advance revisions. The direct path remains observable and is characterized by a test; changing it requires deciding which pathway is authoritative.
+Each buffer operation rebases every anchor in the document, and each buffer transaction snapshots the anchor map for rollback, so a transition costs time proportional to its operations times the anchors held. Composites that use edit references add two transaction-scoped anchors per buffer operation. `set_selections` checks endpoint ownership with a linear scan per endpoint, which is quadratic in a session's selection count. `zig build measure` reports these costs; with a thousand carets, typing one character at each takes milliseconds per submission.
 
-`StaticTokenProvider.refresh` increments its local revision once, even if the document has advanced several revisions. It can report an available state at a different revision from the document. The provider borrows its input spans and never reparses or rebases them. A characterization test preserves visibility of the revision mismatch; it is not an endorsement of that contract.
+Public dead anchors whose resurrection path was discarded stay in storage until their owner disposes of them, by design (SPEC §2.5.6). A client or session that never releases them keeps them.
 
 ## Borrowed results and evaluation
 
-Provider callbacks use opaque engine/event pointers. Array ownership is defined for token, diagnostic and semantic-token queries, but nested strings and syntax/type/hover/symbol lifetimes depend on the provider. Tree-sitter syntax paths expire at refresh/destruction. Validation reports borrow their original intent; evaluation values do not own intent backing storage.
+Provider callbacks use opaque engine and block pointers. Array ownership is defined for token, diagnostic and semantic-token queries, but nested strings and syntax/type/hover/symbol lifetimes depend on the provider. Tree-sitter syntax paths expire at refresh/destruction. Evaluation values do not own intent backing storage. `queryRegister` returns a value borrowed until the session next changes.
 
-The native evaluation carrier meters view operations, not arbitrary callback execution. It is not a sandbox or a CPU-time bound. The evaluation search path also needs review: a match beyond the evaluation bounds returns null without freeing the owned match text.
+The native evaluation carrier meters view operations, not arbitrary callback execution. It is not a sandbox or a CPU-time bound.
+
+`queryCapabilities` returns its supported-view list in engine-owned scratch storage, so the result is valid only until the next call.
 
 ## Persistence
 
-Save copies the full document and writes synchronously. A supplied path replaces the stored path before the write succeeds; a failed save can therefore change the document path. Save is not an atomic filesystem replacement. Dirty state compares revision numbers rather than text identity, so undoing to identical text does not necessarily clear it.
+Save copies the full document and writes synchronously. Save is not an atomic filesystem replacement: a failed write can leave the target file partly written, although the stored path and saved revision change only after the write succeeds. Dirty state compares revision numbers rather than text identity, so undoing to identical text does not necessarily clear it.

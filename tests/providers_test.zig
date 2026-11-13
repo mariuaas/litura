@@ -1,6 +1,7 @@
 //! Document behavior exercised through the public package.
 const std = @import("std");
 const litura = @import("litura");
+const support = @import("support.zig");
 const buffer_types = litura.types;
 const BufferEngine = litura.BufferEngine;
 const views = litura.views;
@@ -166,7 +167,10 @@ test "view provider registration rejects overlapping views atomically" {
         engine.registerViewProvider(overlapping_provider.overlappingProvider()),
     );
 
-    try std.testing.expectEqual(views.ViewStateKind.available, engine.queryViewState("tokens").kind);
+    try std.testing.expectEqual(
+        views.ViewStateKind.available,
+        engine.queryViewState("tokens").kind,
+    );
     try std.testing.expectEqual(views.ViewStateKind.absent, engine.queryViewState("syntax").kind);
 }
 
@@ -182,7 +186,11 @@ test "mutation marks provider stale until token query refreshes" {
 
         fn stateFor(ptr: *anyopaque, view: []const u8, revision: u32) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!std.mem.eql(u8, view, "tokens") and !std.mem.eql(u8, view, "syntax")) return views.ViewState.absent(view, revision);
+            if (!std.mem.eql(u8, view, "tokens") and !std.mem.eql(
+                u8,
+                view,
+                "syntax",
+            )) return views.ViewState.absent(view, revision);
             if (self.stale or self.revision != revision) {
                 return .{ .view = view, .revision = self.revision, .kind = .stale };
             }
@@ -213,7 +221,12 @@ test "mutation marks provider stale until token query refreshes" {
         ) ![]const views.TokenSpan {
             var spans = try allocator.alloc(views.TokenSpan, 2);
             spans[0] = .{ .start = 0, .end = 3, .kind = "keyword", .style = "syntax:keyword" };
-            spans[1] = .{ .start = 4, .end = 7, .kind = "identifier", .style = "syntax:identifier" };
+            spans[1] = .{
+                .start = 4,
+                .end = 7,
+                .kind = "identifier",
+                .style = "syntax:identifier",
+            };
             return spans;
         }
 
@@ -263,7 +276,12 @@ test "mutation marks provider stale until token query refreshes" {
         ) anyerror!views.SyntaxNodeInfo {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             if (ref.revision != typed_engine.revision) return error.InvalidArgument;
-            return .{ .ref = ref, .kind = "function_definition", .start = 0, .end = typed_engine.graphemeCount() };
+            return .{
+                .ref = ref,
+                .kind = "function_definition",
+                .start = 0,
+                .end = typed_engine.graphemeCount(),
+            };
         }
 
         fn typeAt(_: *anyopaque, _: *anyopaque, _: u32, _: u32) anyerror!?views.TypeInfo {
@@ -331,14 +349,20 @@ test "mutation marks provider stale until token query refreshes" {
     var provider = FakeProvider{};
     try engine.registerViewProvider(provider.provider());
 
-    try engine.applyOps(&[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "    return 1\n" } }}, "test", "direct");
+    try support.edit(
+        &engine,
+        &[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "    return 1\n" } }},
+    );
     try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("tokens").kind);
 
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
     try std.testing.expectEqual(@as(u32, 1), provider.refreshes);
     try std.testing.expectEqual(@as(usize, 2), spans.len);
-    try std.testing.expectEqual(views.ViewStateKind.available, engine.queryViewState("tokens").kind);
+    try std.testing.expectEqual(
+        views.ViewStateKind.available,
+        engine.queryViewState("tokens").kind,
+    );
 }
 
 test "token queries degrade when refreshed view is unavailable" {
@@ -486,7 +510,11 @@ test "syntax node refs are revision scoped" {
         fn stateFor(ptr: *anyopaque, view: []const u8, revision: u32) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, view, "syntax")) return views.ViewState.absent(view, revision);
-            if (self.stale or self.revision != revision) return .{ .view = view, .revision = self.revision, .kind = .stale };
+            if (self.stale or self.revision != revision) return .{
+                .view = view,
+                .revision = self.revision,
+                .kind = .stale,
+            };
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
@@ -543,7 +571,12 @@ test "syntax node refs are revision scoped" {
             revision: u32,
         ) ?views.SyntaxNodeInfo {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
-            return .{ .ref = .{ .provider = "fake-syntax", .revision = revision, .path = &[_]u32{0} }, .kind = "function_definition", .start = 0, .end = typed_engine.graphemeCount() };
+            return .{
+                .ref = .{ .provider = "fake-syntax", .revision = revision, .path = &[_]u32{0} },
+                .kind = "function_definition",
+                .start = 0,
+                .end = typed_engine.graphemeCount(),
+            };
         }
 
         fn nodeInfo(
@@ -553,7 +586,12 @@ test "syntax node refs are revision scoped" {
         ) anyerror!views.SyntaxNodeInfo {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             if (ref.revision != typed_engine.revision) return error.InvalidArgument;
-            return .{ .ref = ref, .kind = "function_definition", .start = 0, .end = typed_engine.graphemeCount() };
+            return .{
+                .ref = ref,
+                .kind = "function_definition",
+                .start = 0,
+                .end = typed_engine.graphemeCount(),
+            };
         }
 
         fn typeAt(_: *anyopaque, _: *anyopaque, _: u32, _: u32) anyerror!?views.TypeInfo {
@@ -622,7 +660,10 @@ test "syntax node refs are revision scoped" {
     try engine.registerViewProvider(provider.provider());
 
     const node = (try engine.queryEnclosingSyntaxNode(1, null)).?;
-    try engine.applyOps(&[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "    return 1\n" } }}, "test", "direct");
+    try support.edit(
+        &engine,
+        &[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "    return 1\n" } }},
+    );
     try std.testing.expectError(error.InvalidArgument, engine.querySyntaxNodeInfo(node.ref));
 }
 
@@ -639,7 +680,11 @@ test "type info queries route through provider state and refresh" {
         fn stateFor(ptr: *anyopaque, view: []const u8, revision: u32) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, view, "type_info")) return views.ViewState.absent(view, revision);
-            if (self.stale or self.revision != revision) return .{ .view = view, .revision = self.revision, .kind = .stale };
+            if (self.stale or self.revision != revision) return .{
+                .view = view,
+                .revision = self.revision,
+                .kind = .stale,
+            };
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
@@ -703,12 +748,22 @@ test "type info queries route through provider state and refresh" {
         }
 
         fn typeAt(_: *anyopaque, _: *anyopaque, position: u32, _: u32) anyerror!?views.TypeInfo {
-            if (position == 0) return .{ .start = 0, .end = 3, .type_text = "Int", .source = "fake-types" };
+            if (position == 0) return .{
+                .start = 0,
+                .end = 3,
+                .type_text = "Int",
+                .source = "fake-types",
+            };
             return null;
         }
 
         fn hoverAt(_: *anyopaque, _: *anyopaque, position: u32, _: u32) anyerror!?views.HoverInfo {
-            if (position == 1) return .{ .start = 0, .end = 3, .content = "`abc`: demo hover", .source = "fake-hover" };
+            if (position == 1) return .{
+                .start = 0,
+                .end = 3,
+                .content = "`abc`: demo hover",
+                .source = "fake-hover",
+            };
             return null;
         }
 
@@ -775,7 +830,10 @@ test "type info queries route through provider state and refresh" {
     try std.testing.expectEqual(@as(u32, 0), provider.refreshes);
 
     try std.testing.expect((try engine.queryTypeAt(2, null)) == null);
-    try engine.applyOps(&[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "x" } }}, "test", "direct");
+    try support.edit(
+        &engine,
+        &[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "x" } }},
+    );
     _ = (try engine.queryTypeAt(0, null)).?;
     try std.testing.expectEqual(@as(u32, 1), provider.refreshes);
 }
@@ -793,7 +851,11 @@ test "hover queries route through provider state and refresh" {
         fn stateFor(ptr: *anyopaque, view: []const u8, revision: u32) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, view, "hover")) return views.ViewState.absent(view, revision);
-            if (self.stale or self.revision != revision) return .{ .view = view, .revision = self.revision, .kind = .stale };
+            if (self.stale or self.revision != revision) return .{
+                .view = view,
+                .revision = self.revision,
+                .kind = .stale,
+            };
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
@@ -861,7 +923,12 @@ test "hover queries route through provider state and refresh" {
         }
 
         fn hoverAt(_: *anyopaque, _: *anyopaque, position: u32, _: u32) anyerror!?views.HoverInfo {
-            if (position == 1) return .{ .start = 0, .end = 3, .content = "`abc`: demo hover", .source = "fake-hover" };
+            if (position == 1) return .{
+                .start = 0,
+                .end = 3,
+                .content = "`abc`: demo hover",
+                .source = "fake-hover",
+            };
             return null;
         }
 
@@ -936,7 +1003,10 @@ test "hover queries route through provider state and refresh" {
     try std.testing.expectEqual(@as(u32, 0), provider.refreshes);
 
     try std.testing.expect((try engine.queryHover(2, null)) == null);
-    try engine.applyOps(&[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "x" } }}, "test", "direct");
+    try support.edit(
+        &engine,
+        &[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "x" } }},
+    );
     _ = (try engine.queryHover(1, null)).?;
     try std.testing.expectEqual(@as(u32, 1), provider.refreshes);
 }
@@ -953,7 +1023,11 @@ test "symbols queries route through provider capabilities and result variants" {
         fn stateFor(ptr: *anyopaque, view: []const u8, revision: u32) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, view, "symbols")) return views.ViewState.absent(view, revision);
-            if (self.stale or self.revision != revision) return .{ .view = view, .revision = self.revision, .kind = .stale };
+            if (self.stale or self.revision != revision) return .{
+                .view = view,
+                .revision = self.revision,
+                .kind = .stale,
+            };
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 

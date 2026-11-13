@@ -2,6 +2,18 @@
 
 const std = @import("std");
 const buffer_types = @import("buffer_types.zig");
+const events = @import("events.zig");
+const BufferEngine = @import("buffer_engine.zig").BufferEngine;
+
+/// Whether a block passed to onBufferEvent changed the document text. Interaction and
+/// lifecycle blocks do not, so views derived from text stay current across them.
+pub fn changesText(block: *anyopaque) bool {
+    const typed: *const events.Block = @ptrCast(@alignCast(block));
+    return switch (typed.*) {
+        .transition => |transition| transition.edit != null,
+        .lifecycle => false,
+    };
+}
 
 pub const ViewStateKind = enum {
     available,
@@ -111,7 +123,7 @@ pub const RenamePrepareResult = union(enum) {
 /// Borrows an implementation pointer and callback table. View names must remain valid
 /// for the entire registration. Successful registration transfers deinit responsibility
 /// to the engine, which calls it once per unique implementation pointer.
-/// The event pointer and its payload are borrowed only for the callback duration.
+/// The block passed to onBufferEvent is borrowed only for the callback duration.
 /// Token/diagnostic/semantic-token result arrays use the supplied allocator; nested
 /// strings and syntax/type/hover/symbol results retain provider-defined lifetimes.
 pub const ViewProvider = struct {
@@ -124,7 +136,8 @@ pub const ViewProvider = struct {
         deinitFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
         stateForFn: *const fn (ptr: *anyopaque, view: []const u8, revision: u32) ViewState,
         refreshFn: *const fn (ptr: *anyopaque, engine: *anyopaque) ViewState,
-        onBufferEventFn: *const fn (ptr: *anyopaque, engine: *anyopaque, event: *anyopaque) void,
+        /// `block` points to a `*const events.Block`.
+        onBufferEventFn: *const fn (ptr: *anyopaque, engine: *anyopaque, block: *anyopaque) void,
         tokenSpansFn: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
@@ -213,14 +226,14 @@ pub const ViewProvider = struct {
         return self.vtable.refreshFn(self.ptr, engine);
     }
 
-    /// Tells the provider that a submission has been published, once per distinct
-    /// provider and after every part of the submission, including a composite's
-    /// interaction part. The event is borrowed for the call. Notification cannot fail,
-    /// so work that can (reparsing, for instance) belongs in `refresh`; a provider that
-    /// cannot keep up reports a stale state instead. The provider may read the engine but
-    /// must not mutate it: `submit` and `applyOps` return error.ReentrantMutation here.
-    pub fn onBufferEvent(self: ViewProvider, engine: *anyopaque, event: *anyopaque) void {
-        self.vtable.onBufferEventFn(self.ptr, engine, event);
+    /// Hands the provider a published block, once per distinct provider, after the
+    /// whole transition or lifecycle request is published. `block` points to a
+    /// `*const events.Block`, borrowed for the call. Notification cannot fail, so work
+    /// that can (reparsing, for instance) belongs in `refresh`; a provider that cannot
+    /// keep up reports a stale state instead. The provider may read the engine but must
+    /// not change it: every state-changing entry point returns error.ReentrantMutation.
+    pub fn onBufferEvent(self: ViewProvider, engine: *anyopaque, block: *anyopaque) void {
+        self.vtable.onBufferEventFn(self.ptr, engine, block);
     }
 
     pub fn tokenSpans(
@@ -314,9 +327,11 @@ pub const ViewProvider = struct {
     }
 };
 
-/// Borrows spans and their strings; the instance must outlive its registration.
-/// Its deinit callback is a no-op. Refresh increments its own revision by one;
-/// it does not synchronize to the engine revision.
+/// Fixed token spans for one document revision. Borrows spans and their strings; the
+/// instance must outlive its registration. Its deinit callback is a no-op. The spans
+/// cannot follow edits: once the engine moves past `revision`, the provider reports
+/// itself stale, and refresh keeps it stale rather than relabelling old spans as
+/// current. Replace `spans` and `revision` to describe a new revision.
 pub const StaticTokenProvider = struct {
     spans: []const TokenSpan,
     revision: u32 = 0,
@@ -371,23 +386,21 @@ pub const StaticTokenProvider = struct {
     }
 
     fn refresh(ptr: *anyopaque, engine: *anyopaque) ViewState {
-        _ = engine;
         const self: *StaticTokenProvider = @ptrCast(@alignCast(ptr));
-        // This provider advances one revision per refresh; it does not synchronize with the engine.
-        self.revision += 1;
-        self.stale = false;
+        const document: *const BufferEngine = @ptrCast(@alignCast(engine));
+        // Only the revision the spans were written for can be served as available.
+        self.stale = document.revision != self.revision;
         return .{
             .view = "tokens",
             .revision = self.revision,
-            .kind = .available,
+            .kind = if (self.stale) .stale else .available,
         };
     }
 
-    fn onBufferEvent(ptr: *anyopaque, engine: *anyopaque, event: *anyopaque) void {
+    fn onBufferEvent(ptr: *anyopaque, engine: *anyopaque, block: *anyopaque) void {
         _ = engine;
-        _ = event;
         const self: *StaticTokenProvider = @ptrCast(@alignCast(ptr));
-        self.stale = true;
+        if (changesText(block)) self.stale = true;
     }
 
     fn tokenSpans(

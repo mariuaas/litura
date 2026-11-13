@@ -1,32 +1,32 @@
 //! Regression coverage added during the structural cleanup.
 const std = @import("std");
 const litura = @import("litura");
+const support = @import("support.zig");
 
-test "direct anchor movement preserves the current interaction revision" {
-    // Characterize the existing low-level behavior; revision routing is a separate change.
+test "static token spans are served only for the revision they describe" {
     var document = try litura.BufferEngine.initFromText(std.testing.allocator, "abc", null);
     defer document.deinit();
-    const cursor = try document.createAnchor(0, .sticky);
-    const session = try document.createSession(&.{cursor});
-    const revision = try document.interactionRevision(session);
-    try document.moveAnchor(cursor, 2);
-    try std.testing.expectEqual(@as(?u32, 2), (try document.queryAnchor(cursor)).position);
-    try std.testing.expectEqual(revision, try document.interactionRevision(session));
-}
-
-test "static token refresh advances by one even when the requested revision skips" {
-    // Keep this provider's current refresh behavior visible until its contract is revised.
-    var document = try litura.BufferEngine.init(std.testing.allocator);
-    defer document.deinit();
-    var provider = litura.views.StaticTokenProvider{ .spans = &.{} };
+    var provider = litura.views.StaticTokenProvider{
+        .spans = &.{.{ .start = 0, .end = 3, .kind = "word", .style = "plain" }},
+    };
     try document.registerViewProvider(provider.provider());
-    var first = try document.apply(&.{.{ .insert = .{ .pos = 0, .text = "a" } }}, "test", "insert");
-    defer first.deinit(std.testing.allocator);
-    var second = try document.apply(&.{.{ .insert = .{ .pos = 1, .text = "b" } }}, "test", "insert");
-    defer second.deinit(std.testing.allocator);
+
+    // At revision 0 the spans describe the text.
+    const ViewStateKind = litura.views.ViewStateKind;
+    try std.testing.expectEqual(ViewStateKind.available, document.refreshView("tokens").kind);
+    const current = try document.queryTokenSpans(0, 3, null);
+    defer std.testing.allocator.free(current);
+    try std.testing.expectEqual(@as(usize, 1), current.len);
+
+    // After an edit the spans no longer match the text, and refresh cannot fix that.
+    try support.edit(&document, &.{.{ .insert = .{ .pos = 0, .text = "xy" } }});
     const state = document.refreshView("tokens");
-    try std.testing.expectEqual(@as(?u32, 1), state.revision);
-    try std.testing.expectEqual(@as(u32, 2), document.revision);
+    try std.testing.expectEqual(ViewStateKind.stale, state.kind);
+    try std.testing.expectEqual(@as(?u32, 0), state.revision);
+    try std.testing.expectEqual(ViewStateKind.stale, document.queryViewState("tokens").kind);
+    const stale = try document.queryTokenSpans(0, document.graphemeCount(), null);
+    defer std.testing.allocator.free(stale);
+    try std.testing.expectEqual(@as(usize, 0), stale.len);
 }
 
 test "Unicode offset maps release partial allocations on failure" {

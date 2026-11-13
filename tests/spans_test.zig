@@ -126,7 +126,10 @@ test "word span resolver follows cursor traversal rules" {
 
     try std.testing.expectEqual(@as(?Span, .{ .start = 0, .end = 3 }), try wordSpanAt(&engine, 0));
     try std.testing.expectEqual(@as(?Span, .{ .start = 6, .end = 15 }), try wordSpanAt(&engine, 4));
-    try std.testing.expectEqual(@as(?Span, .{ .start = 6, .end = 15 }), try wordSpanAt(&engine, engine.graphemeCount()));
+    try std.testing.expectEqual(
+        @as(?Span, .{ .start = 6, .end = 15 }),
+        try wordSpanAt(&engine, engine.graphemeCount()),
+    );
     try std.testing.expectEqual(@as(u32, 6), try wordLeftPosition(&engine, engine.graphemeCount()));
     try std.testing.expectEqual(@as(u32, 3), try wordRightPosition(&engine, 0));
 }
@@ -173,15 +176,24 @@ test "transpose word pair matches editor point rules" {
     };
 
     try std.testing.expectEqual(
-        @as(?SpanPair, .{ .first = .{ .start = 0, .end = 5 }, .second = .{ .start = 6, .end = 10 } }),
+        @as(
+            ?SpanPair,
+            .{ .first = .{ .start = 0, .end = 5 }, .second = .{ .start = 6, .end = 10 } },
+        ),
         try transposeWordPair(&engine, 0),
     );
     try std.testing.expectEqual(
-        @as(?SpanPair, .{ .first = .{ .start = 6, .end = 10 }, .second = .{ .start = 11, .end = 16 } }),
+        @as(
+            ?SpanPair,
+            .{ .first = .{ .start = 6, .end = 10 }, .second = .{ .start = 11, .end = 16 } },
+        ),
         try transposeWordPair(&engine, 8),
     );
     try std.testing.expectEqual(
-        @as(?SpanPair, .{ .first = .{ .start = 6, .end = 10 }, .second = .{ .start = 11, .end = 16 } }),
+        @as(
+            ?SpanPair,
+            .{ .first = .{ .start = 6, .end = 10 }, .second = .{ .start = 11, .end = 16 } },
+        ),
         try transposeWordPair(&engine, 14),
     );
 }
@@ -227,7 +239,10 @@ test "resolver helpers accept engine view proxy" {
 
     try std.testing.expectEqual(@as(?Span, .{ .start = 0, .end = 5 }), try wordSpanAt(&proxy, 0));
     try std.testing.expectEqual(
-        @as(?SpanPair, .{ .first = .{ .start = 6, .end = 10 }, .second = .{ .start = 11, .end = 16 } }),
+        @as(
+            ?SpanPair,
+            .{ .first = .{ .start = 6, .end = 10 }, .second = .{ .start = 11, .end = 16 } },
+        ),
         try transposeWordPair(&proxy, 8),
     );
     try std.testing.expectEqual(

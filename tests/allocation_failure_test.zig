@@ -12,6 +12,8 @@ const BufferEngine = litura.BufferEngine;
 const types = litura.types;
 const State = @import("engine_state.zig").State;
 const tree_check = @import("tree_check.zig");
+const support = @import("support.zig");
+const id = support.id;
 const allocator = std.testing.allocator;
 
 const Fixture = struct {
@@ -32,8 +34,7 @@ const Fixture = struct {
         self.engine = try BufferEngine.initFromText(self.failing.allocator(), text, null);
         errdefer self.engine.deinit();
         try self.engine.registerViewProvider(self.provider.provider());
-        self.cursor = try self.engine.createAnchor(0, .sticky);
-        self.session = try self.engine.createSession(&.{self.cursor});
+        self.session, self.cursor = try support.caret(&self.engine, 0);
     }
 
     fn deinit(self: *Fixture) void {
@@ -42,9 +43,7 @@ const Fixture = struct {
     }
 
     fn apply(self: *Fixture, op: types.BufferOp) !void {
-        var result = try self.engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &.{op} } } });
-        defer result.deinit(self.engine.allocator);
-        try std.testing.expect(result == .edit_event);
+        try support.edit(&self.engine, &.{op});
     }
 };
 
@@ -80,7 +79,7 @@ fn sweep(
                 return;
             }
             // A failure was absorbed internally: only a rejection may result.
-            try std.testing.expect(owned == .validation_report);
+            try std.testing.expect(owned == .rejected);
         } else |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
         }
@@ -127,12 +126,15 @@ test "exhaustion during a composite with edit references leaves no effect" {
                 .{ .delete = .{ .start = 3, .end = 5 } },
                 .{ .replace = .{ .start = 1, .end = 2, .text = "XY" } },
             };
-            const place = [_]types.InteractionOp{.{ .place_cursor = .{
-                .cursor = fixture.cursor,
-                .at = .{ .edit = .{ .op = 0 } },
-                .mark = .{ .edit = .{ .op = 2, .edge = .start } },
-            } }};
+            const place = [_]types.InteractionOp{.{ .set_selections = .{ .selections = &.{
+                support.placeSpec(
+                    fixture.cursor,
+                    .{ .edit = .{ .op = 0 } },
+                    .{ .edit = .{ .op = 2, .edge = .start } },
+                ),
+            } } }};
             return fixture.engine.submit(.{
+                .id = id,
                 .origin = fixture.engine.revision,
                 .payload = .{ .composite = .{ .parts = &.{
                     .{ .buffer_mutation = .{ .ops = &edits } },
@@ -144,7 +146,7 @@ test "exhaustion during a composite with edit references leaves no effect" {
                 } } },
             });
         }
-    }.act, .edit_event);
+    }.act, .committed);
 }
 
 fn joiningDeletion(fixture: *Fixture) anyerror!void {
@@ -153,11 +155,80 @@ fn joiningDeletion(fixture: *Fixture) anyerror!void {
 }
 
 fn submitUndo(fixture: *Fixture) anyerror!types.SubmitResult {
-    return fixture.engine.submit(.{ .payload = .{ .undo = .{} } });
+    return fixture.engine.submit(
+        .{ .id = id, .origin = fixture.engine.revision, .payload = .{ .undo = .{} } },
+    );
 }
 
 test "exhaustion during undo that resurrects an anchor leaves no effect" {
-    try sweep("e\nX\n\u{0301}", joiningDeletion, submitUndo, .edit_event);
+    try sweep("e\nX\n\u{0301}", joiningDeletion, submitUndo, .committed);
+}
+
+test "exhaustion during undo of nested deletions in one entry leaves no effect" {
+    // The second deletion kills the first's undo target, so replay must resurrect it
+    // between the two inverse operations.
+    try sweep("abcdefgh", struct {
+        fn setup(fixture: *Fixture) anyerror!void {
+            _ = try fixture.engine.createAnchor(5, .weak);
+            _ = try fixture.engine.createAnchor(7, .weak);
+            var result = try fixture.engine.submit(
+                .{
+                    .id = id,
+                    .origin = fixture.engine.revision,
+                    .payload = .{ .buffer_mutation = .{ .ops = &.{
+                        .{ .delete = .{ .start = 4, .end = 6 } },
+                        .{ .delete = .{ .start = 2, .end = 6 } },
+                    } } },
+                },
+            );
+            defer result.deinit(fixture.engine.allocator);
+            try std.testing.expect(result == .committed);
+        }
+    }.setup, submitUndo, .committed);
+}
+
+/// Places the fixture's cursor with a mark, replacing the mark it already has.
+fn placeWithMark(fixture: *Fixture) anyerror!types.SubmitResult {
+    return fixture.engine.submit(.{
+        .id = id,
+        .origin = fixture.engine.revision,
+        .payload = .{ .interaction_mutation = .{
+            .session_id = fixture.session,
+            .origin = try fixture.engine.interactionRevision(fixture.session),
+            .ops = &.{
+                .{ .set_selections = .{ .selections = &.{
+                    support.placeSpec(fixture.cursor, .{ .position = 3 }, .{ .position = 1 }),
+                } } },
+                .{ .write_register = .{ .key = "mode", .value = .{ .string = "visual" } } },
+            },
+        } },
+    });
+}
+
+test "exhaustion during an interaction-only mutation leaves no effect" {
+    try sweep("abcdef", struct {
+        fn setup(fixture: *Fixture) anyerror!void {
+            var result = try placeWithMark(fixture);
+            result.deinit(fixture.engine.allocator);
+        }
+    }.setup, placeWithMark, .committed);
+}
+
+test "exhaustion while constructing an engine leaks nothing" {
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_after });
+        var engine = BufferEngine.initFromText(
+            failing.allocator(),
+            base_text,
+            "doc.txt",
+        ) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        engine.deinit();
+        if (!failing.has_induced_failure) return;
+    }
 }
 
 test "exhaustion during redo leaves no effect" {
@@ -169,18 +240,26 @@ test "exhaustion during redo leaves no effect" {
         }
     }.setup, struct {
         fn act(fixture: *Fixture) anyerror!types.SubmitResult {
-            return fixture.engine.submit(.{ .payload = .{ .redo = .{} } });
+            return fixture.engine.submit(
+                .{ .id = id, .origin = fixture.engine.revision, .payload = .{ .redo = .{} } },
+            );
         }
-    }.act, .edit_event);
+    }.act, .committed);
 }
 
 test "exhaustion during an unaligned splice leaves no effect" {
     try sweep("cafe", noSetup, struct {
         fn act(fixture: *Fixture) anyerror!types.SubmitResult {
             const op = [_]types.BufferOp{.{ .insert = .{ .pos = 4, .text = "\u{0301}" } }};
-            return fixture.engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &op } } });
+            return fixture.engine.submit(
+                .{
+                    .id = id,
+                    .origin = fixture.engine.revision,
+                    .payload = .{ .buffer_mutation = .{ .ops = &op } },
+                },
+            );
         }
-    }.act, .edit_event);
+    }.act, .committed);
 }
 
 test "exhaustion during a multi-chunk paste that splits nodes leaves no effect" {
@@ -189,9 +268,15 @@ test "exhaustion during a multi-chunk paste that splits nodes leaves no effect" 
             const paste = "0123456789" ** 120;
             const mid = fixture.engine.graphemeCount() / 2;
             const op = [_]types.BufferOp{.{ .insert = .{ .pos = mid, .text = paste } }};
-            return fixture.engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &op } } });
+            return fixture.engine.submit(
+                .{
+                    .id = id,
+                    .origin = fixture.engine.revision,
+                    .payload = .{ .buffer_mutation = .{ .ops = &op } },
+                },
+            );
         }
-    }.act, .edit_event);
+    }.act, .committed);
 }
 
 test "exhaustion during a deletion across many leaves leaves no effect" {
@@ -199,9 +284,15 @@ test "exhaustion during a deletion across many leaves leaves no effect" {
         fn act(fixture: *Fixture) anyerror!types.SubmitResult {
             const count = fixture.engine.graphemeCount();
             const op = [_]types.BufferOp{.{ .delete = .{ .start = 10, .end = count - 10 } }};
-            return fixture.engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &op } } });
+            return fixture.engine.submit(
+                .{
+                    .id = id,
+                    .origin = fixture.engine.revision,
+                    .payload = .{ .buffer_mutation = .{ .ops = &op } },
+                },
+            );
         }
-    }.act, .edit_event);
+    }.act, .committed);
 }
 
 test "exhaustion during a deletion that empties the document leaves no effect" {
@@ -209,9 +300,15 @@ test "exhaustion during a deletion that empties the document leaves no effect" {
         fn act(fixture: *Fixture) anyerror!types.SubmitResult {
             const count = fixture.engine.graphemeCount();
             const op = [_]types.BufferOp{.{ .delete = .{ .start = 0, .end = count } }};
-            return fixture.engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &op } } });
+            return fixture.engine.submit(
+                .{
+                    .id = id,
+                    .origin = fixture.engine.revision,
+                    .payload = .{ .buffer_mutation = .{ .ops = &op } },
+                },
+            );
         }
-    }.act, .edit_event);
+    }.act, .committed);
 }
 
 test "exhaustion while rejecting a composite after its buffer operations leaves no effect" {
@@ -222,11 +319,12 @@ test "exhaustion while rejecting a composite after its buffer operations leaves 
                 .{ .insert = .{ .pos = 2, .text = "x" } },
                 .{ .delete = .{ .start = 1, .end = 4 } },
             };
-            const place = [_]types.InteractionOp{.{ .place_cursor = .{
-                .cursor = fixture.cursor,
-                .at = .{ .edit = .{ .op = 0, .edge = .start } },
-            } }};
+            const place = [_]types.InteractionOp{.{ .set_selections = .{ .selections = &.{
+                .{ .start = .{ .new = .{ .position = 0 } } },
+                support.placeSpec(fixture.cursor, .{ .edit = .{ .op = 0, .edge = .start } }, null),
+            } } }};
             return fixture.engine.submit(.{
+                .id = id,
                 .origin = fixture.engine.revision,
                 .payload = .{ .composite = .{ .parts = &.{
                     .{ .buffer_mutation = .{ .ops = &edits } },
@@ -238,7 +336,7 @@ test "exhaustion while rejecting a composite after its buffer operations leaves 
                 } } },
             });
         }
-    }.act, .validation_report);
+    }.act, .rejected);
 }
 
 test "exhaustion while rejecting a payload with an invalid later operation leaves no effect" {
@@ -249,7 +347,108 @@ test "exhaustion while rejecting a payload with an invalid later operation leave
                 .{ .replace = .{ .start = 5, .end = 40, .text = "replacement" } },
                 .{ .delete = .{ .start = count, .end = count + 5 } },
             };
-            return fixture.engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &ops } } });
+            return fixture.engine.submit(
+                .{
+                    .id = id,
+                    .origin = fixture.engine.revision,
+                    .payload = .{ .buffer_mutation = .{ .ops = &ops } },
+                },
+            );
         }
-    }.act, .validation_report);
+    }.act, .rejected);
+}
+
+test "exhaustion while creating a session leaves no effect and issues no identity" {
+    try sweep("abcdef", noSetup, struct {
+        fn act(fixture: *Fixture) anyerror!types.SubmitResult {
+            const block = try fixture.engine.createSession(
+                .{ .id = id, .origin = fixture.engine.revision, .selections = &.{
+                    .{
+                        .start = .{ .new = .{ .position = 1 } },
+                        .end = .{ .new = .{ .position = 4 } },
+                    },
+                    .{ .start = .{ .new = .{ .anchor = fixture.cursor } } },
+                } },
+            );
+            return .{ .committed = block };
+        }
+    }.act, .committed);
+}
+
+test "exhaustion during a composite that prepares new endpoints leaves no effect" {
+    try sweep("abcdef", noSetup, struct {
+        fn act(fixture: *Fixture) anyerror!types.SubmitResult {
+            const session = fixture.session;
+            return fixture.engine.submit(.{
+                .id = id,
+                .origin = fixture.engine.revision,
+                .label = "multi-cursor paste",
+                .source = .{ .extension = "paste" },
+                .payload = .{ .composite = .{ .parts = &.{
+                    .{ .buffer_mutation = .{ .ops = &.{
+                        .{ .insert = .{ .pos = 0, .text = "xy" } },
+                        .{ .insert = .{ .pos = 5, .text = "z" } },
+                    } } },
+                    .{
+                        .interaction_mutation = .{
+                            .session_id = session,
+                            .origin = try fixture.engine.interactionRevision(session),
+                            .ops = &.{
+                                .{ .set_selections = .{ .selections = &.{
+                                    .{ .start = .{ .new = .{ .edit = .{ .op = 0 } } } },
+                                    .{ .start = .{
+                                        .new = .{ .edit = .{ .op = 1, .edge = .start } },
+                                    }, .end = .{
+                                        .new = .{ .edit = .{ .op = 1 } },
+                                    } },
+                                    .{ .start = .{ .keep = fixture.cursor } },
+                                } } },
+                                .{ .write_register = .{ .key = "pasted", .value = .{ .int = 2 } } },
+                            },
+                        },
+                    },
+                } } },
+            });
+        }
+    }.act, .committed);
+}
+
+test "exhaustion while dropping a session is impossible: teardown does not allocate" {
+    var fixture: Fixture = undefined;
+    try fixture.init("abc");
+    defer fixture.deinit();
+    fixture.failing.fail_index = fixture.failing.alloc_index;
+    var block = try fixture.engine.dropSession(.{ .id = id, .session = fixture.session });
+    block.deinit(fixture.engine.allocator);
+    try std.testing.expect(!fixture.failing.has_induced_failure);
+}
+
+test "exhaustion while taking a snapshot of several sessions leaks and double-frees nothing" {
+    var fixture: Fixture = undefined;
+    try fixture.init("abcdef");
+    defer fixture.deinit();
+    for (0..3) |index| {
+        const session, _ = try support.caret(&fixture.engine, @intCast(index));
+        var written = try fixture.engine.submit(
+            .{ .id = id, .origin = fixture.engine.revision, .payload = .{ .interaction_mutation = .{
+                .session_id = session,
+                .origin = 0,
+                .ops = &.{
+                    .{ .write_register = .{ .key = "mode", .value = .{ .string = "insert" } } },
+                    .{ .write_register = .{ .key = "count", .value = .{ .int = 2 } } },
+                },
+            } } },
+        );
+        written.deinit(fixture.engine.allocator);
+    }
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_after });
+        var snapshot = fixture.engine.snapshot(failing.allocator()) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        snapshot.deinit(failing.allocator());
+        if (!failing.has_induced_failure) break;
+    }
 }

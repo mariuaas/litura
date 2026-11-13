@@ -1,9 +1,15 @@
-//! Borrowed intent payloads and owning edit, validation and evaluation results.
+//! Borrowed intent and request payloads, and owning validation and evaluation results.
 
 const std = @import("std");
 
 pub const anchors = @import("anchors.zig");
 pub const queries = @import("queries.zig");
+pub const events = @import("events.zig");
+
+pub const IntentId = events.IntentId;
+pub const Source = events.Source;
+pub const InteractionValue = events.InteractionValue;
+pub const Edge = events.Edge;
 
 pub const Insert = struct {
     pos: u32,
@@ -36,31 +42,20 @@ pub const Range = struct {
     end: u32,
 };
 
-/// Owns affected_ranges, source and cause through the engine allocator.
-/// Call deinit once; copying the record does not duplicate ownership.
-pub const EditEvent = struct {
-    old_revision: u32,
-    new_revision: u32,
-    affected_ranges: []const Range,
-    edit_class: []const u8,
-    source: []const u8,
-    cause: []const u8,
-
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        allocator.free(self.affected_ranges);
-        allocator.free(self.source);
-        allocator.free(self.cause);
-        self.* = undefined;
-    }
-};
-
 pub const DeadAnchorRecord = struct {
     anchor: anchors.AnchorId,
     offset: u32,
     stickiness: anchors.AnchorStickiness,
+    /// Public anchors may be disposed of before undo reaches the record, which then
+    /// skips them; an internal one missing means the history is corrupt.
+    kind: anchors.AnchorKind = .client,
 };
 
 pub const DeletionMeta = struct {
+    /// Index in the undo entry's inverse_ops of the operation that restores this
+    /// deletion. Offsets describe the text right after that operation, so replay
+    /// resurrects the anchors immediately after it, before any later operation.
+    op: u32,
     target_anchor: anchors.AnchorId,
     inverse_text: []u8,
     dead_anchors: []const DeadAnchorRecord,
@@ -96,18 +91,8 @@ pub const UndoEntry = struct {
     }
 };
 
-pub const MoveCursorAnchor = struct {
-    cursor: anchors.AnchorId,
-    position: u32,
-};
-
-pub const SetCursorSelection = struct {
-    cursor: anchors.AnchorId,
-    mark_position: ?u32,
-};
-
 /// Which edge of a buffer operation's inserted text an EditRef designates.
-pub const EditEdge = enum { start, end };
+pub const EditEdge = Edge;
 
 /// Symbolic reference to the realized result of a buffer operation in the same
 /// Composite (SPEC §2.6.1). `op` indexes the composite's buffer operations in order.
@@ -118,36 +103,70 @@ pub const EditRef = struct {
     edge: EditEdge = .end,
 };
 
-/// A document position computed by the client, which must be current at the intent's
-/// document origin, or an EditRef the engine resolves after applying the buffer operations.
-pub const InteractionTarget = union(enum) {
+/// Where an endpoint goes (SPEC §2.6.1). Every target samples a position: none creates
+/// a relationship with what it names.
+pub const Target = union(enum) {
+    /// Coordinate-bearing: valid only at the intent's document origin.
     position: u32,
+    /// The realized result of a buffer operation; composites only.
     edit: EditRef,
+    /// The current position of a live public anchor; anchor-scoped.
+    anchor: anchors.AnchorId,
 };
 
-/// Places a session cursor and sets (or, with null, clears) its mark.
-pub const PlaceCursor = struct {
-    cursor: anchors.AnchorId,
-    at: InteractionTarget,
-    mark: ?InteractionTarget = null,
+pub const Move = struct {
+    anchor: anchors.AnchorId,
+    to: Target,
+};
+
+/// How a selection endpoint relates to the session's current endpoints.
+pub const Endpoint = union(enum) {
+    /// An endpoint the session owns, with its identity, position and status unchanged.
+    keep: anchors.AnchorId,
+    /// An endpoint the session owns, keeping its identity at a new position. Must be live.
+    move: Move,
+    /// A fresh endpoint anchor.
+    new: Target,
+};
+
+/// One selection in a replacement list. A null `end` makes a caret: one anchor serves
+/// as both endpoints.
+pub const SelectionSpec = struct {
+    start: Endpoint,
+    end: ?Endpoint = null,
+    active: Edge = .end,
+};
+
+/// Replaces a session's selection list. Every endpoint and target is resolved against
+/// the same state, before any of them takes effect; endpoints the list omits are
+/// released afterwards.
+pub const SetSelections = struct {
+    selections: []const SelectionSpec,
+};
+
+pub const WriteRegister = struct {
+    key: []const u8,
+    value: InteractionValue,
+};
+
+pub const ClearRegister = struct {
+    key: []const u8,
 };
 
 pub const InteractionOp = union(enum) {
-    move_cursor_anchor: MoveCursorAnchor,
-    set_cursor_selection: SetCursorSelection,
-    place_cursor: PlaceCursor,
+    set_selections: SetSelections,
+    write_register: WriteRegister,
+    clear_register: ClearRegister,
 };
 
+/// Operations on one session, applied in order. `origin` is the interaction revision
+/// the client observed (SPEC §4.2). It is required: the mutation is rejected as stale
+/// unless it equals the session's current revision, so there is no way to change a
+/// session without stating which state the change was computed against.
 pub const InteractionMutation = struct {
     session_id: u32,
+    origin: u32,
     ops: []const InteractionOp,
-    origin: ?u32 = null,
-};
-
-pub const InteractionResult = struct {
-    session_id: u32,
-    old_revision: u32,
-    new_revision: u32,
 };
 
 pub const Composite = struct {
@@ -306,14 +325,37 @@ pub const Guard = union(enum) {
     }
 };
 
-/// Borrows payload slices, text, guards, source and cause for synchronous submission.
-/// Keep all referenced storage alive through the call; this record does not free it.
+/// Borrows payload slices, text, guards, source and label for synchronous submission.
+/// Keep all referenced storage alive through the call; this record does not free it,
+/// and no result refers to it afterwards.
 pub const Intent = struct {
+    id: IntentId,
     payload: IntentPayload,
-    source: []const u8 = "user",
-    cause: []const u8 = "direct",
-    origin: ?u32 = null,
+    source: Source = .user_input,
+    /// A descriptive name for the transition, echoed in its block; not causal.
+    label: ?[]const u8 = null,
+    /// The document revision the intent was computed against (SPEC §4.2). Required: a
+    /// request built against the current document states `engine.revision`. Buffer
+    /// operations, undo, redo and position-bearing interaction targets are rejected as
+    /// stale unless it is current; anchor-scoped interaction mutations do not depend
+    /// on it (SPEC §2.6).
+    origin: u32,
     guards: []const Guard = &.{},
+};
+
+/// Creates a session (an intrinsic request). Every endpoint must be `new`, with a
+/// position or anchor target. Borrowed for the call.
+pub const SessionCreation = struct {
+    id: IntentId,
+    selections: []const SelectionSpec,
+    /// The document revision the positions were computed against; it must be current.
+    origin: u32,
+};
+
+/// Drops a session and releases its endpoints and registers (an intrinsic request).
+pub const SessionDrop = struct {
+    id: IntentId,
+    session: u32,
 };
 
 pub const GuardFail = struct {
@@ -351,20 +393,55 @@ pub const GuardResult = union(enum) {
     }
 };
 
+/// Owns its copy of the guard and its result.
 pub const GuardEval = struct {
     guard: Guard,
     result: GuardResult,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        freeGuard(allocator, self.guard);
         self.result.deinit(allocator);
         self.* = undefined;
     }
 };
 
-/// Owns per_guard results and message, but borrows the original intent and its inputs.
-/// Call deinit with the engine allocator; it does not free the intent.
+/// A copy of `guard` that owns its strings, for a report that outlives the intent.
+pub fn dupeGuard(allocator: std.mem.Allocator, guard: Guard) !Guard {
+    return switch (guard) {
+        .anchor_liveness, .range_ordering, .diagnostic_at, .no_diagnostic_at => guard,
+        .slice_equality => |payload| blk: {
+            var copy = payload;
+            copy.expected = try allocator.dupe(u8, payload.expected);
+            break :blk .{ .slice_equality = copy };
+        },
+        .slice_hash => |payload| blk: {
+            var copy = payload;
+            copy.digest = try allocator.dupe(u8, payload.digest);
+            break :blk .{ .slice_hash = copy };
+        },
+        .semantic_token_type_at => |payload| blk: {
+            var copy = payload;
+            copy.type_name = try allocator.dupe(u8, payload.type_name);
+            break :blk .{ .semantic_token_type_at = copy };
+        },
+    };
+}
+
+/// Frees a guard made by dupeGuard.
+pub fn freeGuard(allocator: std.mem.Allocator, guard: Guard) void {
+    switch (guard) {
+        .anchor_liveness, .range_ordering, .diagnostic_at, .no_diagnostic_at => {},
+        .slice_equality => |payload| allocator.free(payload.expected),
+        .slice_hash => |payload| allocator.free(payload.digest),
+        .semantic_token_type_at => |payload| allocator.free(payload.type_name),
+    }
+}
+
+/// A rejection, owning everything it holds: the guards and results, and the message. It
+/// identifies the intent instead of copying it, so it stays valid after the caller frees
+/// the intent's memory. Call deinit with the engine allocator, on exactly one copy.
 pub const ValidationReport = struct {
-    intent: Intent,
+    intent: IntentId,
     intent_class: IntentClass,
     head_revision: u32,
     interaction_revision: ?u32,
@@ -380,16 +457,17 @@ pub const ValidationReport = struct {
     }
 };
 
+/// The outcome of one submission: the committed transition's block, or the report of
+/// a rejection, which publishes nothing. Owned through the engine allocator: deinit
+/// the result, or take the payload out and deinit that instead, but not both.
 pub const SubmitResult = union(enum) {
-    edit_event: EditEvent,
-    interaction_result: InteractionResult,
-    validation_report: ValidationReport,
+    committed: events.Block,
+    rejected: ValidationReport,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .edit_event => |*event| event.deinit(allocator),
-            .interaction_result => {},
-            .validation_report => |*report| report.deinit(allocator),
+            .committed => |*block| block.deinit(allocator),
+            .rejected => |*report| report.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -513,6 +591,12 @@ pub const SymbolCapabilities = struct {
     rename: bool,
 };
 
+/// How an engine orders intents (SPEC §6.1). A `queued` engine sequences pending
+/// intents by priority and registration order. A `synchronous` engine applies each
+/// submission when it is made, in call order, and accepts no priority: ordering among
+/// submissions belongs to the host that makes them.
+pub const Sequencing = enum { queued, synchronous };
+
 pub const EngineCapabilities = struct {
     protocol_version: []const u8,
     supported_views: []const []const u8,
@@ -522,5 +606,6 @@ pub const EngineCapabilities = struct {
     apply_policies: []const []const u8,
     program_carriers: []const ProgramCarrierProfile,
     rebase_policy: RebasePolicy,
+    sequencing: Sequencing,
     limits: EngineLimits,
 };

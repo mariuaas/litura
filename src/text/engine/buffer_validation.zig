@@ -32,9 +32,9 @@ const ResolvedRange = struct {
     }
 };
 
-fn makeGuardPass(guard: types.Guard) types.GuardEval {
+fn makeGuardPass(engine: *const BufferEngine, guard: types.Guard) !types.GuardEval {
     return .{
-        .guard = guard,
+        .guard = try types.dupeGuard(engine.allocator, guard),
         .result = .{ .pass = {} },
     };
 }
@@ -59,10 +59,12 @@ fn makeGuardFail(
     reason: []const u8,
     dead_anchor: ?anchors.AnchorId,
 ) !types.GuardEval {
+    const owned_reason = try engine.allocator.dupe(u8, reason);
+    errdefer engine.allocator.free(owned_reason);
     return .{
-        .guard = guard,
+        .guard = try types.dupeGuard(engine.allocator, guard),
         .result = .{ .fail = .{
-            .reason = try engine.allocator.dupe(u8, reason),
+            .reason = owned_reason,
             .dead_anchor = dead_anchor,
         } },
     };
@@ -74,11 +76,13 @@ fn makeGuardUnavailable(
     missing_view: types.ViewClass,
     state: views.ViewState,
 ) !types.GuardEval {
+    var snapshot = try snapshotViewState(engine, state);
+    errdefer snapshot.deinit(engine.allocator);
     return .{
-        .guard = guard,
+        .guard = try types.dupeGuard(engine.allocator, guard),
         .result = .{ .unavailable = .{
             .missing_view = missing_view,
-            .state = try snapshotViewState(engine, state),
+            .state = snapshot,
         } },
     };
 }
@@ -123,7 +127,7 @@ pub fn validationReport(
     per_guard: []types.GuardEval,
 ) !types.ValidationReport {
     return .{
-        .intent = intent,
+        .intent = intent.id,
         .intent_class = derivedIntentClass(intent),
         .head_revision = engine.revision,
         .interaction_revision = interactionRevisionForIntent(engine, intent),
@@ -230,7 +234,7 @@ fn semanticTokenContainsPosition(token: views.SemanticToken, position: u32) bool
 fn evaluateGuard(engine: *const BufferEngine, guard: types.Guard) !types.GuardEval {
     return switch (guard) {
         .anchor_liveness => |payload| blk: {
-            const anchor = engine.anchors_map.get(payload.anchor.value) orelse {
+            const anchor = engine.publicAnchor(payload.anchor) orelse {
                 const reason = try std.fmt.allocPrint(engine.allocator, "unknown anchor id: {d}", .{payload.anchor.value});
                 defer engine.allocator.free(reason);
                 break :blk try makeGuardFail(engine, guard, reason, null);
@@ -240,7 +244,7 @@ fn evaluateGuard(engine: *const BufferEngine, guard: types.Guard) !types.GuardEv
                 defer engine.allocator.free(reason);
                 break :blk try makeGuardFail(engine, guard, reason, payload.anchor);
             }
-            break :blk makeGuardPass(guard);
+            break :blk try makeGuardPass(engine, guard);
         },
         .range_ordering => |payload| blk: {
             var left = try resolveGuardPositionRef(engine, payload.a);
@@ -258,7 +262,7 @@ fn evaluateGuard(engine: *const BufferEngine, guard: types.Guard) !types.GuardEv
             }
 
             if (left.position.? <= right.position.?) {
-                break :blk makeGuardPass(guard);
+                break :blk try makeGuardPass(engine, guard);
             }
 
             const reason = try std.fmt.allocPrint(engine.allocator, "range ordering failed: {d} > {d}", .{ left.position.?, right.position.? });
@@ -299,7 +303,7 @@ fn evaluateGuard(engine: *const BufferEngine, guard: types.Guard) !types.GuardEv
             const actual = try engine.table.getTextRange(resolved.start.?, resolved.end.?);
             defer engine.allocator.free(actual);
             if (std.mem.eql(u8, actual, payload.expected)) {
-                break :blk makeGuardPass(guard);
+                break :blk try makeGuardPass(engine, guard);
             }
 
             break :blk try makeGuardFail(engine, guard, "slice equality failed", null);
@@ -337,7 +341,7 @@ fn evaluateGuard(engine: *const BufferEngine, guard: types.Guard) !types.GuardEv
 
             const digest = try xxh64Digest(engine, resolved.start.?, resolved.end.?);
             if (std.mem.eql(u8, digest[0..], payload.digest)) {
-                break :blk makeGuardPass(guard);
+                break :blk try makeGuardPass(engine, guard);
             }
 
             break :blk try makeGuardFail(engine, guard, "slice hash failed", null);
@@ -368,7 +372,7 @@ fn evaluateGuard(engine: *const BufferEngine, guard: types.Guard) !types.GuardEv
                 if (payload.severity) |severity| {
                     if (diagnostic.severity != @intFromEnum(severity)) continue;
                 }
-                break :blk makeGuardPass(guard);
+                break :blk try makeGuardPass(engine, guard);
             }
 
             break :blk try makeGuardFail(engine, guard, "diagnostic guard failed", null);
@@ -402,7 +406,7 @@ fn evaluateGuard(engine: *const BufferEngine, guard: types.Guard) !types.GuardEv
                 break :blk try makeGuardFail(engine, guard, "diagnostic guard failed", null);
             }
 
-            break :blk makeGuardPass(guard);
+            break :blk try makeGuardPass(engine, guard);
         },
         .semantic_token_type_at => |payload| blk: {
             var resolved = try resolveGuardPositionRef(engine, payload.position);
@@ -428,7 +432,7 @@ fn evaluateGuard(engine: *const BufferEngine, guard: types.Guard) !types.GuardEv
             for (tokens) |token| {
                 if (!semanticTokenContainsPosition(token, start)) continue;
                 if (std.mem.eql(u8, token.type_name, payload.type_name)) {
-                    break :blk makeGuardPass(guard);
+                    break :blk try makeGuardPass(engine, guard);
                 }
                 break :blk try makeGuardFail(engine, guard, "semantic token guard failed", null);
             }
@@ -477,7 +481,7 @@ fn resolveGuardPositionRef(
             break :blk .{ .position = position };
         },
         .anchor => |anchor_id| blk: {
-            const anchor = engine.anchors_map.get(anchor_id.value) orelse {
+            const anchor = engine.publicAnchor(anchor_id) orelse {
                 break :blk .{ .reason = try std.fmt.allocPrint(engine.allocator, "unknown anchor id: {d}", .{anchor_id.value}) };
             };
             if (anchor.status == .dead) {
@@ -498,7 +502,7 @@ pub fn validationReportForStaleBufferOrigin(
     engine: *const BufferEngine,
     intent: types.Intent,
 ) !?types.ValidationReport {
-    const origin = intent.origin orelse return null;
+    const origin = intent.origin;
     if (origin == engine.revision) return null;
 
     const message = try std.fmt.allocPrint(
@@ -515,7 +519,7 @@ pub fn validationReportForStaleInteractionOrigin(
     intent: types.Intent,
     payload: types.InteractionMutation,
 ) !?types.ValidationReport {
-    const origin = payload.origin orelse return null;
+    const origin = payload.origin;
     const current_revision = engine.interactionRevision(payload.session_id) catch {
         const message = try std.fmt.allocPrint(engine.allocator, "unknown session id: {d}", .{payload.session_id});
         defer engine.allocator.free(message);
@@ -558,106 +562,59 @@ pub fn bufferOpMessage(engine: *const BufferEngine, op: types.BufferOp) !?[]u8 {
     };
 }
 
-fn validateInteractionCursor(
-    engine: *const BufferEngine,
-    session_id: u32,
-    cursor_anchor: anchors.AnchorId,
-) !void {
-    if (engine.sessions.get(session_id)) |sess| {
-        for (sess.interaction.cursors.items) |cursor| {
-            if (cursor.anchor.value == cursor_anchor.value) return;
+/// The target an endpoint resolves, if it has one.
+fn endpointTarget(endpoint: types.Endpoint) ?types.Target {
+    return switch (endpoint) {
+        .keep => null,
+        .move => |move| move.to,
+        .new => |target| target,
+    };
+}
+
+/// Whether any target of the mutation has the given tag.
+fn interactionHasTarget(payload: types.InteractionMutation, tag: std.meta.Tag(types.Target)) bool {
+    for (payload.ops) |op| {
+        const spec = switch (op) {
+            .set_selections => |spec| spec,
+            .write_register, .clear_register => continue,
+        };
+        for (spec.selections) |selection| {
+            for ([_]?types.Endpoint{ selection.start, selection.end }) |maybe| {
+                const target = endpointTarget(maybe orelse continue) orelse continue;
+                if (target == tag) return true;
+            }
         }
     }
-    return error.KeyError;
+    return false;
 }
 
 /// Whether an interaction mutation carries document positions, which are only meaningful
 /// at the document revision they were computed against.
 pub fn interactionHasPositions(payload: types.InteractionMutation) bool {
-    for (payload.ops) |op| switch (op) {
-        .move_cursor_anchor => return true,
-        .set_cursor_selection => |selection| if (selection.mark_position != null) return true,
-        .place_cursor => |place| {
-            if (place.at == .position) return true;
-            if (place.mark) |mark| if (mark == .position) return true;
-        },
-    };
-    return false;
+    return interactionHasTarget(payload, .position);
 }
 
 /// Whether an interaction mutation refers symbolically to buffer operation results.
 /// Such references are resolved by the engine, not by the client, and are only
 /// meaningful inside a Composite.
 pub fn interactionHasEditRefs(payload: types.InteractionMutation) bool {
-    for (payload.ops) |op| switch (op) {
-        .place_cursor => |place| {
-            if (place.at == .edit) return true;
-            if (place.mark) |mark| if (mark == .edit) return true;
-        },
-        else => {},
-    };
-    return false;
+    return interactionHasTarget(payload, .edit);
 }
 
-pub fn validateInteractionMutation(
-    engine: *const BufferEngine,
-    payload: types.InteractionMutation,
-    max_position: u32,
-) !?[]u8 {
-    if (payload.ops.len == 0) return try engine.allocator.dupe(u8, "interaction mutation requires at least one operation");
-
+/// The first edit reference naming a buffer operation the composite does not have.
+pub fn editRefOutOfRange(payload: types.InteractionMutation, op_count: usize) ?u32 {
     for (payload.ops) |op| {
-        switch (op) {
-            .move_cursor_anchor => |move| {
-                validateInteractionCursor(engine, payload.session_id, move.cursor) catch {
-                    return try std.fmt.allocPrint(
-                        engine.allocator,
-                        "cursor {d} is not part of session {d}",
-                        .{ move.cursor.value, payload.session_id },
-                    );
-                };
-                if (move.position > max_position) return try std.fmt.allocPrint(engine.allocator, "position {d} out of range", .{move.position});
-            },
-            .set_cursor_selection => |selection| {
-                validateInteractionCursor(engine, payload.session_id, selection.cursor) catch {
-                    return try std.fmt.allocPrint(
-                        engine.allocator,
-                        "cursor {d} is not part of session {d}",
-                        .{ selection.cursor.value, payload.session_id },
-                    );
-                };
-                if (selection.mark_position) |mark_position| {
-                    if (mark_position > max_position) return try std.fmt.allocPrint(engine.allocator, "position {d} out of range", .{mark_position});
-                }
-            },
-            .place_cursor => |place| {
-                validateInteractionCursor(engine, payload.session_id, place.cursor) catch {
-                    return try std.fmt.allocPrint(
-                        engine.allocator,
-                        "cursor {d} is not part of session {d}",
-                        .{ place.cursor.value, payload.session_id },
-                    );
-                };
-                for ([_]?types.InteractionTarget{ place.at, place.mark }) |maybe_target| {
-                    const target = maybe_target orelse continue;
-                    switch (target) {
-                        .position => |position| if (position > max_position) {
-                            return try std.fmt.allocPrint(
-                                engine.allocator,
-                                "position {d} out of range",
-                                .{position},
-                            );
-                        },
-                        .edit => return try engine.allocator.dupe(
-                            u8,
-                            "edit references require a buffer operation in the same composite",
-                        ),
-                    }
-                }
-            },
+        const spec = switch (op) {
+            .set_selections => |spec| spec,
+            .write_register, .clear_register => continue,
+        };
+        for (spec.selections) |selection| {
+            for ([_]?types.Endpoint{ selection.start, selection.end }) |maybe| {
+                const target = endpointTarget(maybe orelse continue) orelse continue;
+                if (target == .edit and target.edit.op >= op_count) return target.edit.op;
+            }
         }
     }
-
     return null;
 }
 
@@ -699,7 +656,12 @@ test "guard validation passes for live guards" {
         .{ .slice_hash = .{ .start = .{ .position = 0 }, .end = .{ .position = 5 }, .digest = digest[0..], .max_extent = 8 } },
     };
 
-    const intent = types.Intent{ .payload = .{ .buffer_mutation = .{ .ops = &.{} } }, .guards = &guards };
+    const intent = types.Intent{
+        .origin = engine.revision,
+        .id = .{ .value = 0 },
+        .payload = .{ .buffer_mutation = .{ .ops = &.{} } },
+        .guards = &guards,
+    };
     try std.testing.expectEqual(@as(?types.ValidationReport, null), try validationReportForGuards(&engine, intent));
 }
 
@@ -709,12 +671,22 @@ test "guard validation reports dead anchor" {
 
     const anchor_id = try engine.createAnchor(2, .weak);
     const ops = [_]types.BufferOp{.{ .delete = .{ .start = 1, .end = 4 } }};
-    try engine.applyOps(&ops, "test", "direct");
+    var edit = try engine.submit(.{
+        .id = .{ .value = 1 },
+        .origin = engine.revision,
+        .payload = .{ .buffer_mutation = .{ .ops = &ops } },
+    });
+    edit.deinit(std.testing.allocator);
 
     const guards = [_]types.Guard{
         .{ .anchor_liveness = .{ .anchor = anchor_id } },
     };
-    const intent = types.Intent{ .payload = .{ .buffer_mutation = .{ .ops = &.{} } }, .guards = &guards };
+    const intent = types.Intent{
+        .origin = engine.revision,
+        .id = .{ .value = 0 },
+        .payload = .{ .buffer_mutation = .{ .ops = &.{} } },
+        .guards = &guards,
+    };
     var report = (try validationReportForGuards(&engine, intent)).?;
     defer report.deinit(std.testing.allocator);
 
@@ -735,7 +707,12 @@ test "guard validation rejects oversized slice extent" {
     const guards = [_]types.Guard{
         .{ .slice_equality = .{ .start = .{ .position = 0 }, .end = .{ .position = 5 }, .expected = "hello", .max_extent = 2 } },
     };
-    const intent = types.Intent{ .payload = .{ .buffer_mutation = .{ .ops = &.{} } }, .guards = &guards };
+    const intent = types.Intent{
+        .origin = engine.revision,
+        .id = .{ .value = 0 },
+        .payload = .{ .buffer_mutation = .{ .ops = &.{} } },
+        .guards = &guards,
+    };
     var report = (try validationReportForGuards(&engine, intent)).?;
     defer report.deinit(std.testing.allocator);
 
@@ -750,7 +727,12 @@ test "advisory view guard degrades without elevating intent class" {
     const guards = [_]types.Guard{
         .{ .diagnostic_at = .{ .position = .{ .position = 0 }, .required = false } },
     };
-    const intent = types.Intent{ .payload = .{ .buffer_mutation = .{ .ops = &.{} } }, .guards = &guards };
+    const intent = types.Intent{
+        .origin = engine.revision,
+        .id = .{ .value = 0 },
+        .payload = .{ .buffer_mutation = .{ .ops = &.{} } },
+        .guards = &guards,
+    };
     var report = (try validationReportForGuards(&engine, intent)).?;
     defer report.deinit(std.testing.allocator);
 
@@ -924,6 +906,8 @@ test "optional view guards evaluate against available diagnostics and semantic t
         .{ .semantic_token_type_at = .{ .position = .{ .position = 0 }, .type_name = "variable" } },
     };
     try std.testing.expectEqual(@as(?types.ValidationReport, null), try validationReportForGuards(&engine, .{
+        .id = .{ .value = 0 },
+        .origin = engine.revision,
         .payload = .{ .buffer_mutation = .{ .ops = &.{} } },
         .guards = &passing,
     }));
@@ -932,6 +916,8 @@ test "optional view guards evaluate against available diagnostics and semantic t
         .{ .no_diagnostic_at = .{ .position = .{ .position = 0 } } },
     };
     var report = (try validationReportForGuards(&engine, .{
+        .id = .{ .value = 0 },
+        .origin = engine.revision,
         .payload = .{ .buffer_mutation = .{ .ops = &.{} } },
         .guards = &failing,
     })).?;

@@ -65,11 +65,13 @@ pub const RegionInfo = struct {
     }
 };
 
+/// A public anchor handle's state. `position` is null unless `status` is live, and
+/// `stickiness` is null for a disposed handle, which has no storage left.
 pub const AnchorInfo = struct {
     id: anchors.AnchorId,
     position: ?u32,
-    stickiness: anchors.AnchorStickiness,
-    status: anchors.AnchorStatus,
+    stickiness: ?anchors.AnchorStickiness,
+    status: anchors.HandleStatus,
 };
 
 /// Owns its text or rows. Call deinit with the allocator used by the query.

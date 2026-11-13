@@ -4,19 +4,20 @@ const litura = @import("litura");
 const BufferEngine = litura.BufferEngine;
 const allocator = std.testing.allocator;
 const decomposed = "e\u{0301}";
+const support = @import("support.zig");
 
 fn insert(engine: *BufferEngine, position: u32, text: []const u8) !void {
     var result = try engine.submit(.{
+        .id = .{ .value = 0 },
         .origin = engine.revision,
         .payload = .{ .buffer_mutation = .{ .ops = &.{.{ .insert = .{
             .pos = position,
             .text = text,
         } }} } },
-        .source = "test",
-        .cause = "separate-code-point-input",
+        .label = "separate-code-point-input",
     });
     defer result.deinit(allocator);
-    try std.testing.expect(result == .edit_event);
+    try std.testing.expect(result == .committed);
 }
 
 fn expectText(engine: *BufferEngine, expected: []const u8) !void {
@@ -45,8 +46,7 @@ test "separate base and combining insertions form one logical grapheme" {
 test "sticky session cursor remains at the end of a combined grapheme" {
     var engine = try BufferEngine.init(allocator);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    const session = try engine.createSession(&.{cursor});
+    const session, const cursor = try support.caret(&engine, 0);
     try insert(&engine, 0, "e");
     try std.testing.expectEqual(@as(?u32, 1), (try engine.queryAnchor(cursor)).position);
     const interaction_revision = try engine.interactionRevision(session);
@@ -60,11 +60,11 @@ test "sticky session cursor remains at the end of a combined grapheme" {
 test "one grapheme deletion removes separately inserted base and accent and undo restores both" {
     var engine = try BufferEngine.init(allocator);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    _ = try engine.createSession(&.{cursor});
+    _, const cursor = try support.caret(&engine, 0);
     try insert(&engine, 0, "e");
     try insert(&engine, 1, "\u{0301}");
     var deletion = try engine.submit(.{
+        .id = .{ .value = 0 },
         .origin = engine.revision,
         .payload = .{ .buffer_mutation = .{ .ops = &.{.{ .delete = .{
             .start = 0,
@@ -72,13 +72,15 @@ test "one grapheme deletion removes separately inserted base and accent and undo
         } }} } },
     });
     defer deletion.deinit(allocator);
-    try std.testing.expect(deletion == .edit_event);
+    try std.testing.expect(deletion == .committed);
     try expectText(&engine, "");
     try std.testing.expectEqual(@as(u32, 0), engine.graphemeCount());
     try std.testing.expectEqual(@as(?u32, 0), (try engine.queryAnchor(cursor)).position);
-    var undo = try engine.submit(.{ .payload = .{ .undo = .{} }, .origin = engine.revision });
+    var undo = try engine.submit(
+        .{ .id = .{ .value = 0 }, .payload = .{ .undo = .{} }, .origin = engine.revision },
+    );
     defer undo.deinit(allocator);
-    try std.testing.expect(undo == .edit_event);
+    try std.testing.expect(undo == .committed);
     try expectText(&engine, decomposed);
     try std.testing.expectEqual(@as(u32, 1), engine.graphemeCount());
     try std.testing.expectEqual(@as(?u32, 1), (try engine.queryAnchor(cursor)).position);
@@ -90,14 +92,18 @@ test "undo accent insertion restores base and redo restores one grapheme" {
     const cursor = try engine.createAnchor(0, .sticky);
     try insert(&engine, 0, "e");
     try insert(&engine, 1, "\u{0301}");
-    var undo = try engine.submit(.{ .payload = .{ .undo = .{} }, .origin = engine.revision });
+    var undo = try engine.submit(
+        .{ .id = .{ .value = 0 }, .payload = .{ .undo = .{} }, .origin = engine.revision },
+    );
     defer undo.deinit(allocator);
-    try std.testing.expect(undo == .edit_event);
+    try std.testing.expect(undo == .committed);
     try expectText(&engine, "e");
     try std.testing.expectEqual(@as(?u32, 1), (try engine.queryAnchor(cursor)).position);
-    var redo = try engine.submit(.{ .payload = .{ .redo = .{} }, .origin = engine.revision });
+    var redo = try engine.submit(
+        .{ .id = .{ .value = 0 }, .payload = .{ .redo = .{} }, .origin = engine.revision },
+    );
     defer redo.deinit(allocator);
-    try std.testing.expect(redo == .edit_event);
+    try std.testing.expect(redo == .committed);
     try expectText(&engine, decomposed);
     try std.testing.expectEqual(@as(u32, 4), engine.revision);
     try std.testing.expectEqual(@as(u32, 1), engine.graphemeCount());
@@ -137,20 +143,22 @@ test "deleting a separator resegments the newly adjacent text" {
 
 fn submitOps(engine: *BufferEngine, ops: []const litura.types.BufferOp) !void {
     var result = try engine.submit(.{
+        .id = .{ .value = 0 },
         .origin = engine.revision,
         .payload = .{ .buffer_mutation = .{ .ops = ops } },
     });
     defer result.deinit(allocator);
-    try std.testing.expect(result == .edit_event);
+    try std.testing.expect(result == .committed);
 }
 
 fn submitHistory(engine: *BufferEngine, comptime kind: enum { undo, redo }) !void {
     var result = try engine.submit(.{
+        .id = .{ .value = 0 },
         .origin = engine.revision,
         .payload = if (kind == .undo) .{ .undo = .{} } else .{ .redo = .{} },
     });
     defer result.deinit(allocator);
-    try std.testing.expect(result == .edit_event);
+    try std.testing.expect(result == .committed);
 }
 
 /// Oracle: the engine's clusters must equal whole-text segmentation of its current text.
@@ -283,7 +291,7 @@ test "undo of a joining deletion restores text and resurrects interior weak anch
     try expectText(&engine, decomposed);
     try std.testing.expectEqual(@as(u32, 1), engine.graphemeCount());
     try std.testing.expectEqual(
-        litura.anchors.AnchorStatus.dead,
+        litura.anchors.HandleStatus.dead,
         (try engine.queryAnchor(interior)).status,
     );
 
@@ -327,21 +335,22 @@ test "SPEC 1.4: Replace is not Delete followed by Insert" {
     try std.testing.expectEqual(@as(u32, 1), payload.revision);
 }
 
-test "SPEC 2.5.1 and 7: inverse and affected range come from the realized splice" {
+test "SPEC 2.5.1 and 7: the inverse and the reported splice are the realized splice" {
     var engine = try BufferEngine.initFromText(allocator, "e", null);
     defer engine.deinit();
     var result = try engine.submit(.{
+        .id = .{ .value = 0 },
         .origin = engine.revision,
         .payload = .{
             .buffer_mutation = .{ .ops = &.{.{ .insert = .{ .pos = 1, .text = "\u{0301}" } }} },
         },
     });
     defer result.deinit(allocator);
-    // Non-empty affected range with an unchanged grapheme count.
+    // The splice rewrites "e" as "é": a non-empty region with an unchanged grapheme count.
     try std.testing.expectEqualSlices(
-        litura.types.Range,
-        &.{.{ .start = 0, .end = 1 }},
-        result.edit_event.affected_ranges,
+        litura.events.RealizedSplice,
+        &.{.{ .start = 0, .old_end = 1, .new_end = 1 }},
+        result.committed.transition.edit.?.splices,
     );
     const inverse = engine.undo_stack.items[0].inverse_ops[0].replace;
     try std.testing.expectEqual(@as(u32, 0), inverse.start);

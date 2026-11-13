@@ -64,6 +64,19 @@ pub fn build(b: *std.Build) void {
     example.root_module.addImport("litura", module);
     b.getInstallStep().dependOn(&example.step);
     b.step("example", "Run a document edit through the public module").dependOn(&b.addRunArtifact(example).step);
+
+    const measure = b.addExecutable(.{ .name = "litura-measure", .root_module = b.createModule(.{
+        .root_source_file = b.path("bench/blocks.zig"),
+        .target = target,
+        .optimize = b.option(
+            std.builtin.OptimizeMode,
+            "measure-optimize",
+            "Optimization mode for `measure` (default ReleaseFast)",
+        ) orelse .ReleaseFast,
+    }) });
+    measure.root_module.addImport("litura", module);
+    const measure_step = b.step("measure", "Measure block production for one caret and a thousand");
+    measure_step.dependOn(&b.addRunArtifact(measure).step);
 }
 
 /// Behavioral tests import the public module; `conformance_stride` samples the Unicode

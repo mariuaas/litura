@@ -148,8 +148,10 @@ pub const View = struct {
         try self.checkPosition(resolved_start, true);
 
         var match = (try self.engine.findNext(query, resolved_start)) orelse return null;
-        errdefer match.deinit(self.engine.allocator);
-        if (match.start < self.min_position or match.end > self.max_position) return null;
+        if (match.start < self.min_position or match.end > self.max_position) {
+            match.deinit(self.engine.allocator);
+            return null;
+        }
         return match;
     }
 };
@@ -173,6 +175,8 @@ pub fn queryCapabilities() types.EngineCapabilities {
         .program_carriers = engine_program_carriers[0..],
         // Litura retains no splice history: every stale origin is rejected.
         .rebase_policy = .reject,
+        // `submit` applies each intent when it is called; Intent has no priority.
+        .sequencing = .synchronous,
         .limits = .{
             .max_fuel = max_eval_fuel,
             .max_lookahead = max_lookahead,

@@ -85,17 +85,20 @@ fn expectEngineClusters(engine: *BufferEngine, text: []const u8, bounds: []const
 
 fn submit(engine: *BufferEngine, op: BufferOp) !void {
     var result = try engine.submit(.{
+        .id = .{ .value = 0 },
         .origin = engine.revision,
         .payload = .{ .buffer_mutation = .{ .ops = &.{op} } },
     });
     defer result.deinit(allocator);
-    try std.testing.expect(result == .edit_event);
+    try std.testing.expect(result == .committed);
 }
 
 fn submitUndo(engine: *BufferEngine) !void {
-    var result = try engine.submit(.{ .origin = engine.revision, .payload = .{ .undo = .{} } });
+    var result = try engine.submit(
+        .{ .id = .{ .value = 0 }, .origin = engine.revision, .payload = .{ .undo = .{} } },
+    );
     defer result.deinit(allocator);
-    try std.testing.expect(result == .edit_event);
+    try std.testing.expect(result == .committed);
 }
 
 fn position(engine: *BufferEngine, anchor: litura.anchors.AnchorId) !?u32 {
@@ -285,7 +288,12 @@ test "long contextual sequences built one code point at a time" {
         // GB12/13: regional indicator parity across a 401-indicator run.
         .{ .parts = &.{"\u{1F1E6}"}, .times = 401, .tail = "", .clusters = 201 },
         // GB11: one emoji ZWJ sequence of 301 pictographs.
-        .{ .parts = &.{ "\u{1F468}", "\u{200D}" }, .times = 60, .tail = "\u{1F469}", .clusters = 1 },
+        .{
+            .parts = &.{ "\u{1F468}", "\u{200D}" },
+            .times = 60,
+            .tail = "\u{1F469}",
+            .clusters = 1,
+        },
         // GB9c: one Devanagari conjunct of 61 consonants.
         .{ .parts = &.{ "\u{0915}", "\u{094D}" }, .times = 60, .tail = "\u{0937}", .clusters = 1 },
         // GB6-8: one Hangul syllable with long jamo runs.
@@ -348,6 +356,7 @@ test "descending payloads are sequential: an earlier insertion can merge into th
         .{ .delete = .{ .start = 1, .end = 2 } },
     };
     var result = try engine.submit(.{
+        .id = .{ .value = 0 },
         .origin = engine.revision,
         .payload = .{ .buffer_mutation = .{ .ops = &ops } },
     });

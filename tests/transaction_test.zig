@@ -6,33 +6,18 @@ const BufferEngine = litura.BufferEngine;
 const types = litura.types;
 const allocator = std.testing.allocator;
 const State = @import("engine_state.zig").State;
+const support = @import("support.zig");
+const id = support.id;
+const expectText = support.expectText;
+const position = support.position;
 
-fn submit(engine: *BufferEngine, intent: types.Intent) !types.SubmitResult {
-    return engine.submit(intent);
-}
-
-fn expectText(engine: *BufferEngine, expected: []const u8) !void {
-    const text = try engine.getText();
-    defer allocator.free(text);
-    try std.testing.expectEqualStrings(expected, text);
-}
-
-/// Submits one buffer operation at head and requires an edit event.
+/// Submits one buffer operation at head and requires a committed transition.
 fn applyEdit(engine: *BufferEngine, op: types.BufferOp) !void {
-    var result = try engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &.{op} } } });
-    defer result.deinit(engine.allocator);
-    try std.testing.expect(result == .edit_event);
+    try support.edit(engine, &.{op});
 }
 
-fn expectRejected(result: *types.SubmitResult, message: []const u8) !void {
-    defer result.deinit(allocator);
-    try std.testing.expect(result.* == .validation_report);
-    try std.testing.expectEqual(types.ValidationVerdict.invalid, result.validation_report.verdict);
-    try std.testing.expectEqualStrings(message, result.validation_report.message);
-}
-
-fn position(engine: *BufferEngine, anchor: litura.anchors.AnchorId) !?u32 {
-    return (try engine.queryAnchor(anchor)).position;
+fn expectRejected(engine: *BufferEngine, result: *types.SubmitResult, message: []const u8) !void {
+    try support.expectRejected(engine, result, .invalid, message);
 }
 
 test "a later operation invalidated by an earlier merge rejects the whole payload" {
@@ -42,11 +27,13 @@ test "a later operation invalidated by an earlier merge rejects the whole payloa
     const weak = try engine.createAnchor(1, .weak);
 
     // After the accent merges, the document has one grapheme: position 2 does not exist.
-    var result = try engine.submit(.{ .origin = 0, .payload = .{ .buffer_mutation = .{ .ops = &.{
-        .{ .insert = .{ .pos = 1, .text = "\u{0301}" } },
-        .{ .insert = .{ .pos = 2, .text = "x" } },
-    } } } });
-    try expectRejected(&result, "position 2 out of range");
+    var result = try engine.submit(
+        .{ .id = id, .origin = 0, .payload = .{ .buffer_mutation = .{ .ops = &.{
+            .{ .insert = .{ .pos = 1, .text = "\u{0301}" } },
+            .{ .insert = .{ .pos = 2, .text = "x" } },
+        } } } },
+    );
+    try expectRejected(&engine, &result, "position 2 out of range");
 
     try expectText(&engine, "e");
     try std.testing.expectEqual(@as(u32, 0), engine.revision);
@@ -61,15 +48,17 @@ test "rejection restores anchors killed by an earlier operation and drops hidden
     const interior = try engine.createAnchor(2, .weak);
     const anchor_count = engine.anchors_map.count();
 
-    var result = try engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &.{
-        .{ .delete = .{ .start = 1, .end = 4 } },
-        .{ .delete = .{ .start = 1, .end = 5 } },
-    } } } });
-    try expectRejected(&result, "range end 5 out of range");
+    var result = try engine.submit(
+        .{ .id = id, .origin = engine.revision, .payload = .{ .buffer_mutation = .{ .ops = &.{
+            .{ .delete = .{ .start = 1, .end = 4 } },
+            .{ .delete = .{ .start = 1, .end = 5 } },
+        } } } },
+    );
+    try expectRejected(&engine, &result, "range end 5 out of range");
 
     try expectText(&engine, "abcde");
     const info = try engine.queryAnchor(interior);
-    try std.testing.expectEqual(litura.anchors.AnchorStatus.live, info.status);
+    try std.testing.expectEqual(litura.anchors.HandleStatus.live, info.status);
     try std.testing.expectEqual(@as(?u32, 2), info.position);
     try std.testing.expectEqual(anchor_count, engine.anchors_map.count());
 }
@@ -78,16 +67,20 @@ test "rejection preserves the redo branch and committed text" {
     var engine = try BufferEngine.initFromText(allocator, "ab", null);
     defer engine.deinit();
     try applyEdit(&engine, .{ .insert = .{ .pos = 2, .text = "c" } });
-    var undo = try engine.submit(.{ .payload = .{ .undo = .{} } });
+    var undo = try engine.submit(
+        .{ .id = id, .origin = engine.revision, .payload = .{ .undo = .{} } },
+    );
     undo.deinit(allocator);
     try std.testing.expect(engine.canRedo());
     const revision = engine.revision;
 
-    var result = try engine.submit(.{ .payload = .{ .buffer_mutation = .{ .ops = &.{
-        .{ .replace = .{ .start = 0, .end = 2, .text = "x" } },
-        .{ .delete = .{ .start = 0, .end = 2 } },
-    } } } });
-    try expectRejected(&result, "range end 2 out of range");
+    var result = try engine.submit(
+        .{ .id = id, .origin = engine.revision, .payload = .{ .buffer_mutation = .{ .ops = &.{
+            .{ .replace = .{ .start = 0, .end = 2, .text = "x" } },
+            .{ .delete = .{ .start = 0, .end = 2 } },
+        } } } },
+    );
+    try expectRejected(&engine, &result, "range end 2 out of range");
     try expectText(&engine, "ab");
     try std.testing.expectEqual(revision, engine.revision);
     try std.testing.expect(engine.canRedo());
@@ -96,16 +89,16 @@ test "rejection preserves the redo branch and committed text" {
 test "composite interaction positions are validated against the realized text, atomically" {
     var engine = try BufferEngine.initFromText(allocator, "e", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(1, .sticky);
-    const session = try engine.createSession(&.{cursor});
+    const session, const cursor = try support.caret(&engine, 1);
 
     // The additive estimate (2) would accept position 2; the realized text has 1 grapheme.
     for ([_]u32{ 2, 1 }) |target| {
         const insert_accent = [_]types.BufferOp{.{ .insert = .{ .pos = 1, .text = "\u{0301}" } }};
-        const move = [_]types.InteractionOp{
-            .{ .move_cursor_anchor = .{ .cursor = cursor, .position = target } },
-        };
+        const move = [_]types.InteractionOp{.{ .set_selections = .{ .selections = &.{
+            support.placeSpec(cursor, .{ .position = target }, null),
+        } } }};
         var result = try engine.submit(.{
+            .id = id,
             .origin = engine.revision,
             .payload = .{ .composite = .{ .parts = &.{
                 .{ .buffer_mutation = .{ .ops = &insert_accent } },
@@ -117,14 +110,14 @@ test "composite interaction positions are validated against the realized text, a
             } } },
         });
         if (target == 2) {
-            try expectRejected(&result, "position 2 out of range");
+            try expectRejected(&engine, &result, "position 2 out of range");
             try expectText(&engine, "e");
             try std.testing.expectEqual(@as(u32, 0), engine.revision);
             try std.testing.expectEqual(@as(u32, 0), try engine.interactionRevision(session));
             try std.testing.expect(!engine.canUndo());
         } else {
             defer result.deinit(allocator);
-            try std.testing.expect(result == .edit_event);
+            try std.testing.expect(result == .committed);
             try expectText(&engine, "e\u{0301}");
             try std.testing.expectEqual(@as(u32, 1), try engine.interactionRevision(session));
         }
@@ -134,30 +127,26 @@ test "composite interaction positions are validated against the realized text, a
 test "buffer edits, undo, redo and resurrection never advance interaction revisions" {
     var engine = try BufferEngine.initFromText(allocator, "abcdef", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(4, .sticky);
-    const session = try engine.createSession(&.{cursor});
-    try engine.setSessionMarkPosition(session, cursor, 2);
-    const mark = (try engine.querySessionMark(session, cursor)).?;
+    const session, const cursor = try support.caret(&engine, 4);
+    try support.place(&engine, session, cursor, 4, 2);
+    const mark = (try support.mark(&engine, session)).?;
     const revision = try engine.interactionRevision(session);
 
     // Deleting [1, 3) moves the cursor and kills the weak mark.
     try applyEdit(&engine, .{ .delete = .{ .start = 1, .end = 3 } });
     try std.testing.expectEqual(@as(?u32, 2), try position(&engine, cursor));
     try std.testing.expectEqual(
-        litura.anchors.AnchorStatus.dead,
+        litura.anchors.HandleStatus.dead,
         (try engine.queryAnchor(mark)).status,
     );
     try std.testing.expectEqual(revision, try engine.interactionRevision(session));
 
     // Undo moves the cursor back and resurrects the mark; redo moves both again.
-    var undo = try engine.submit(.{ .payload = .{ .undo = .{} } });
-    defer undo.deinit(allocator);
-    try std.testing.expect(undo == .edit_event);
+    try support.undo(&engine);
     try std.testing.expectEqual(@as(?u32, 4), try position(&engine, cursor));
     try std.testing.expectEqual(@as(?u32, 2), try position(&engine, mark));
     try std.testing.expectEqual(revision, try engine.interactionRevision(session));
-    var redo = try engine.submit(.{ .payload = .{ .redo = .{} } });
-    defer redo.deinit(allocator);
+    try support.redo(&engine);
     try std.testing.expectEqual(@as(?u32, 2), try position(&engine, cursor));
     try std.testing.expectEqual(revision, try engine.interactionRevision(session));
 }
@@ -173,76 +162,94 @@ test "the declared Reject policy never interprets stale coordinates" {
     try applyEdit(&engine, .{ .insert = .{ .pos = 0, .text = "X" } });
     const replace_b = [_]types.BufferOp{.{ .replace = .{ .start = 1, .end = 2, .text = "c" } }};
     var result = try engine.submit(.{
+        .id = id,
         .origin = observed,
         .payload = .{ .buffer_mutation = .{ .ops = &replace_b } },
     });
     defer result.deinit(allocator);
-    try std.testing.expect(result == .validation_report);
-    try std.testing.expectEqual(types.ValidationVerdict.stale, result.validation_report.verdict);
+    try std.testing.expect(result == .rejected);
+    try std.testing.expectEqual(types.ValidationVerdict.stale, result.rejected.verdict);
     try expectText(&engine, "Xab");
 }
 
 test "explicit interaction mutations advance the interaction revision once" {
     var engine = try BufferEngine.initFromText(allocator, "abc", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    const session = try engine.createSession(&.{cursor});
-    var result = try engine.submit(.{ .origin = engine.revision, .payload = .{ .interaction_mutation = .{
-        .session_id = session,
-        .origin = 0,
-        .ops = &.{
-            .{ .move_cursor_anchor = .{ .cursor = cursor, .position = 2 } },
-            .{ .set_cursor_selection = .{ .cursor = cursor, .mark_position = 0 } },
-        },
-    } } });
+    const session, const cursor = try support.caret(&engine, 0);
+    var result = try engine.submit(
+        .{ .id = id, .origin = engine.revision, .payload = .{ .interaction_mutation = .{
+            .session_id = session,
+            .origin = 0,
+            .ops = &.{
+                .{
+                    .set_selections = .{
+                        .selections = &.{support.placeSpec(cursor, .{ .position = 2 }, null)},
+                    },
+                },
+                .{ .set_selections = .{ .selections = &.{
+                    support.placeSpec(cursor, .{ .anchor = cursor }, .{ .position = 0 }),
+                } } },
+                .{ .write_register = .{ .key = "mode", .value = .{ .string = "visual" } } },
+            },
+        } } },
+    );
     defer result.deinit(allocator);
-    try std.testing.expectEqual(@as(u32, 1), result.interaction_result.new_revision);
+    const events = result.committed.transition.interactions;
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(@as(u32, 1), events[0].new_revision);
     try std.testing.expectEqual(@as(u32, 1), try engine.interactionRevision(session));
 }
 
 test "position-bearing interaction requests require a current document origin" {
     var engine = try BufferEngine.initFromText(allocator, "abc", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    const session = try engine.createSession(&.{cursor});
+    const session, const cursor = try support.caret(&engine, 0);
     const stale_origin = engine.revision;
     try applyEdit(&engine, .{ .insert = .{ .pos = 0, .text = "xy" } });
 
     // Interaction CAS passes (edits do not advance it), but the position is stale.
-    var stale = try engine.submit(.{ .origin = stale_origin, .payload = .{ .interaction_mutation = .{
-        .session_id = session,
-        .origin = try engine.interactionRevision(session),
-        .ops = &.{.{ .move_cursor_anchor = .{ .cursor = cursor, .position = 1 } }},
-    } } });
+    var stale = try engine.submit(
+        .{ .id = id, .origin = stale_origin, .payload = .{ .interaction_mutation = .{
+            .session_id = session,
+            .origin = try engine.interactionRevision(session),
+            .ops = &.{.{ .set_selections = .{ .selections = &.{
+                support.placeSpec(cursor, .{ .position = 1 }, null),
+            } } }},
+        } } },
+    );
     defer stale.deinit(allocator);
-    try std.testing.expect(stale == .validation_report);
-    try std.testing.expectEqual(types.ValidationVerdict.stale, stale.validation_report.verdict);
+    try std.testing.expect(stale == .rejected);
+    try std.testing.expectEqual(types.ValidationVerdict.stale, stale.rejected.verdict);
     try std.testing.expectEqual(@as(?u32, 2), try position(&engine, cursor));
 
     // Position-free requests are anchor-scoped and do not depend on the document origin.
-    var clear = try engine.submit(.{ .origin = stale_origin, .payload = .{ .interaction_mutation = .{
-        .session_id = session,
-        .origin = try engine.interactionRevision(session),
-        .ops = &.{.{ .set_cursor_selection = .{ .cursor = cursor, .mark_position = null } }},
-    } } });
-    defer clear.deinit(allocator);
-    try std.testing.expect(clear == .interaction_result);
+    var keep = try engine.submit(
+        .{ .id = id, .origin = stale_origin, .payload = .{ .interaction_mutation = .{
+            .session_id = session,
+            .origin = try engine.interactionRevision(session),
+            .ops = &.{
+                .{ .set_selections = .{ .selections = &.{.{ .start = .{ .keep = cursor } }} } },
+            },
+        } } },
+    );
+    try support.expectCommitted(&engine, &keep);
 }
 
 fn placeAfterEdits(
     engine: *BufferEngine,
     session: u32,
     ops: []const types.BufferOp,
-    place: types.PlaceCursor,
+    place: types.SelectionSpec,
 ) !types.SubmitResult {
     return engine.submit(.{
+        .id = id,
         .origin = engine.revision,
         .payload = .{ .composite = .{ .parts = &.{
             .{ .buffer_mutation = .{ .ops = ops } },
             .{ .interaction_mutation = .{
                 .session_id = session,
                 .origin = try engine.interactionRevision(session),
-                .ops = &.{.{ .place_cursor = place }},
+                .ops = &.{.{ .set_selections = .{ .selections = &.{place} } }},
             } },
         } } },
     });
@@ -251,23 +258,22 @@ fn placeAfterEdits(
 test "edit references place the cursor after inserted text without client-side coordinates" {
     var engine = try BufferEngine.initFromText(allocator, "e", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    const session = try engine.createSession(&.{cursor});
+    const session, const cursor = try support.caret(&engine, 0);
     const anchor_count = engine.anchors_map.count();
 
     // The accent merges into "e": the end of the inserted text is after "é".
     var result = try placeAfterEdits(&engine, session, &.{
         .{ .insert = .{ .pos = 1, .text = "\u{0301}" } },
-    }, .{
-        .cursor = cursor,
-        .at = .{ .edit = .{ .op = 0 } },
-        .mark = .{ .edit = .{ .op = 0, .edge = .start } },
-    });
+    }, support.placeSpec(
+        cursor,
+        .{ .edit = .{ .op = 0 } },
+        .{ .edit = .{ .op = 0, .edge = .start } },
+    ));
     defer result.deinit(allocator);
-    try std.testing.expect(result == .edit_event);
+    try std.testing.expect(result == .committed);
     try std.testing.expectEqual(@as(?u32, 1), try position(&engine, cursor));
     // Weak start rounds down to before the merged grapheme.
-    const mark = (try engine.querySessionMark(session, cursor)).?;
+    const mark = (try support.mark(&engine, session)).?;
     try std.testing.expectEqual(@as(?u32, 0), try position(&engine, mark));
     // Result anchors are internal: only the new mark remains.
     try std.testing.expectEqual(anchor_count + 1, engine.anchors_map.count());
@@ -276,36 +282,34 @@ test "edit references place the cursor after inserted text without client-side c
 test "edit references replace a selection and select inserted text" {
     var engine = try BufferEngine.initFromText(allocator, "ab", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(2, .sticky);
-    const session = try engine.createSession(&.{cursor});
+    const session, const cursor = try support.caret(&engine, 2);
 
     var result = try placeAfterEdits(&engine, session, &.{
         .{ .replace = .{ .start = 1, .end = 2, .text = "hello" } },
-    }, .{
-        .cursor = cursor,
-        .at = .{ .edit = .{ .op = 0, .edge = .end } },
-        .mark = .{ .edit = .{ .op = 0, .edge = .start } },
-    });
+    }, support.placeSpec(
+        cursor,
+        .{ .edit = .{ .op = 0, .edge = .end } },
+        .{ .edit = .{ .op = 0, .edge = .start } },
+    ));
     defer result.deinit(allocator);
     try expectText(&engine, "ahello");
     try std.testing.expectEqual(@as(?u32, 6), try position(&engine, cursor));
     try std.testing.expectEqual(
         @as(?u32, 1),
-        try position(&engine, (try engine.querySessionMark(session, cursor)).?),
+        try position(&engine, (try support.mark(&engine, session)).?),
     );
 }
 
 test "edit references are carried through later operations in the payload" {
     var engine = try BufferEngine.initFromText(allocator, "ab", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    const session = try engine.createSession(&.{cursor});
+    const session, const cursor = try support.caret(&engine, 0);
 
     // Operation 0 ends at 3; inserting two graphemes before it moves the result to 5.
     var shifted = try placeAfterEdits(&engine, session, &.{
         .{ .insert = .{ .pos = 2, .text = "X" } },
         .{ .insert = .{ .pos = 0, .text = "YY" } },
-    }, .{ .cursor = cursor, .at = .{ .edit = .{ .op = 0 } } });
+    }, support.placeSpec(cursor, .{ .edit = .{ .op = 0 } }, null));
     defer shifted.deinit(allocator);
     try expectText(&engine, "YYabX");
     try std.testing.expectEqual(@as(?u32, 5), try position(&engine, cursor));
@@ -314,13 +318,12 @@ test "edit references are carried through later operations in the payload" {
 test "an end reference follows a later insertion at the same position, like a Sticky anchor" {
     var engine = try BufferEngine.init(allocator);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    const session = try engine.createSession(&.{cursor});
+    const session, const cursor = try support.caret(&engine, 0);
 
     var result = try placeAfterEdits(&engine, session, &.{
         .{ .insert = .{ .pos = 0, .text = "a" } },
         .{ .insert = .{ .pos = 1, .text = "b" } },
-    }, .{ .cursor = cursor, .at = .{ .edit = .{ .op = 0 } } });
+    }, support.placeSpec(cursor, .{ .edit = .{ .op = 0 } }, null));
     defer result.deinit(allocator);
     try expectText(&engine, "ab");
     try std.testing.expectEqual(@as(?u32, 2), try position(&engine, cursor));
@@ -329,32 +332,42 @@ test "an end reference follows a later insertion at the same position, like a St
 test "edit reference rejections leave no effect" {
     var engine = try BufferEngine.initFromText(allocator, "abcd", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    const session = try engine.createSession(&.{cursor});
+    const session, const cursor = try support.caret(&engine, 0);
     const anchor_count = engine.anchors_map.count();
 
-    var missing = try placeAfterEdits(&engine, session, &.{.{ .insert = .{ .pos = 0, .text = "x" } }}, .{
-        .cursor = cursor,
-        .at = .{ .edit = .{ .op = 1 } },
-    });
-    try expectRejected(&missing, "edit reference to buffer operation 1 is out of range");
+    var missing = try placeAfterEdits(
+        &engine,
+        session,
+        &.{.{ .insert = .{ .pos = 0, .text = "x" } }},
+        support.placeSpec(cursor, .{ .edit = .{ .op = 1 } }, null),
+    );
+    try expectRejected(&engine, &missing, "edit reference to buffer operation 1 is out of range");
 
     // A later deletion strictly around the inserted text kills its Weak start.
     var deleted = try placeAfterEdits(&engine, session, &.{
         .{ .insert = .{ .pos = 2, .text = "x" } },
         .{ .delete = .{ .start = 1, .end = 4 } },
-    }, .{ .cursor = cursor, .at = .{ .edit = .{ .op = 0, .edge = .start } } });
+    }, support.placeSpec(cursor, .{ .edit = .{ .op = 0, .edge = .start } }, null));
     try expectRejected(
+        &engine,
         &deleted,
         "edit reference to buffer operation 0 was deleted by a later operation",
     );
 
-    var pure = try engine.submit(.{ .origin = engine.revision, .payload = .{ .interaction_mutation = .{
-        .session_id = session,
-        .origin = try engine.interactionRevision(session),
-        .ops = &.{.{ .place_cursor = .{ .cursor = cursor, .at = .{ .edit = .{ .op = 0 } } } }},
-    } } });
-    try expectRejected(&pure, "edit references require a buffer operation in the same composite");
+    var pure = try engine.submit(
+        .{ .id = id, .origin = engine.revision, .payload = .{ .interaction_mutation = .{
+            .session_id = session,
+            .origin = try engine.interactionRevision(session),
+            .ops = &.{.{ .set_selections = .{ .selections = &.{
+                support.placeSpec(cursor, .{ .edit = .{ .op = 0 } }, null),
+            } } }},
+        } } },
+    );
+    try expectRejected(
+        &engine,
+        &pure,
+        "edit references require a buffer operation in the same composite",
+    );
 
     try expectText(&engine, "abcd");
     try std.testing.expectEqual(@as(u32, 0), engine.revision);
@@ -440,8 +453,7 @@ test "a transient allocation failure anywhere in a composite leaves no observabl
         var failing: FailOnce = .{ .inner = allocator };
         var engine = try BufferEngine.initFromText(failing.allocator(), "e\nabcd", null);
         defer engine.deinit();
-        const cursor = try engine.createAnchor(0, .sticky);
-        const session = try engine.createSession(&.{cursor});
+        const session, const cursor = try support.caret(&engine, 0);
         const tracked = [3]litura.anchors.AnchorId{
             cursor,
             try engine.createAnchor(4, .weak),
@@ -455,13 +467,16 @@ test "a transient allocation failure anywhere in a composite leaves no observabl
             .{ .delete = .{ .start = 3, .end = 5 } },
             .{ .replace = .{ .start = 1, .end = 2, .text = "XY" } },
         };
-        const place = [_]types.InteractionOp{.{ .place_cursor = .{
-            .cursor = cursor,
-            .at = .{ .edit = .{ .op = 0 } },
-            .mark = .{ .edit = .{ .op = 2, .edge = .start } },
-        } }};
+        const place = [_]types.InteractionOp{.{ .set_selections = .{ .selections = &.{
+            support.placeSpec(
+                cursor,
+                .{ .edit = .{ .op = 0 } },
+                .{ .edit = .{ .op = 2, .edge = .start } },
+            ),
+        } } }};
         failing.remaining = fail_after;
         var result = engine.submit(.{
+            .id = id,
             .origin = engine.revision,
             .payload = .{ .composite = .{ .parts = &.{
                 .{ .buffer_mutation = .{ .ops = &edits } },
@@ -486,7 +501,7 @@ test "a transient allocation failure anywhere in a composite leaves no observabl
             continue;
         };
         defer result.deinit(engine.allocator);
-        try std.testing.expect(result == .edit_event);
+        try std.testing.expect(result == .committed);
         try std.testing.expect(fail_after > 0);
         break;
     }
@@ -501,25 +516,25 @@ test "a transient allocation failure during undo or redo leaves no observable ef
             var failing: FailOnce = .{ .inner = allocator };
             var engine = try BufferEngine.initFromText(failing.allocator(), "e\nX\n\u{0301}", null);
             defer engine.deinit();
-            const cursor = try engine.createAnchor(5, .sticky);
-            const session = try engine.createSession(&.{cursor});
+            const session, const cursor = try support.caret(&engine, 5);
             const tracked = [3]litura.anchors.AnchorId{
                 cursor,
                 try engine.createAnchor(2, .weak),
                 try engine.createAnchor(0, .weak),
             };
             try applyEdit(&engine, .{ .delete = .{ .start = 1, .end = 4 } });
-            if (redo) {
-                var undo = try engine.submit(.{ .payload = .{ .undo = .{} } });
-                undo.deinit(engine.allocator);
-            }
+            if (redo) try support.undo(&engine);
             const before = try Observed.capture(&engine, session, tracked);
             defer engine.allocator.free(before.text);
             const redo_entries = engine.redo_stack.items.len;
 
             failing.remaining = fail_after;
             var result = engine.submit(
-                .{ .payload = if (redo) .{ .redo = .{} } else .{ .undo = .{} } },
+                .{
+                    .id = id,
+                    .origin = engine.revision,
+                    .payload = if (redo) .{ .redo = .{} } else .{ .undo = .{} },
+                },
             ) catch |err| {
                 try std.testing.expectEqual(error.OutOfMemory, err);
                 const after = try Observed.capture(&engine, session, tracked);
@@ -533,7 +548,7 @@ test "a transient allocation failure during undo or redo leaves no observable ef
                 continue;
             };
             defer result.deinit(engine.allocator);
-            try std.testing.expect(result == .edit_event);
+            try std.testing.expect(result == .committed);
             break;
         }
     }
@@ -546,13 +561,19 @@ test "an undo whose anchor resurrection fails has no effect" {
     try engine.registerViewProvider(provider.provider());
     _ = try engine.createAnchor(2, .weak);
     try applyEdit(&engine, .{ .delete = .{ .start = 1, .end = 4 } });
-    // Break the lineage: resurrection needs the deletion's hidden target anchor.
-    try engine.dropAnchor(engine.undo_stack.items[0].deletion_metas[0].target_anchor);
+    // Break the lineage: resurrection needs the deletion's hidden target anchor, which
+    // clients cannot drop, so only engine bookkeeping errors could remove it.
+    const target = engine.undo_stack.items[0].deletion_metas[0].target_anchor;
+    try std.testing.expectError(error.KeyError, engine.dropAnchor(target));
+    try std.testing.expect(engine.anchors_map.remove(target.value));
     provider.stale = false;
     var before = try State.capture(allocator, &engine, &provider);
     defer before.deinit();
 
-    try std.testing.expectError(error.KeyError, engine.submit(.{ .payload = .{ .undo = .{} } }));
+    try std.testing.expectError(
+        error.CorruptHistory,
+        engine.submit(.{ .id = id, .origin = engine.revision, .payload = .{ .undo = .{} } }),
+    );
     var after = try State.capture(allocator, &engine, &provider);
     defer after.deinit();
     try State.expectEqual(&before, &after);

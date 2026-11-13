@@ -38,7 +38,14 @@ test "queryAnchorRange returns live selection text" {
 
         pub fn queryPosition(self: *const @This(), pos: u32) !queries.PositionInfo {
             _ = self;
-            return .{ .position = pos, .line = 0, .col = pos, .line_start = 0, .line_end = 10, .line_end_with_newline = 10 };
+            return .{
+                .position = pos,
+                .line = 0,
+                .col = pos,
+                .line_start = 0,
+                .line_end = 10,
+                .line_end_with_newline = 10,
+            };
         }
 
         pub fn graphemeCount(self: *const @This()) u32 {
@@ -114,7 +121,14 @@ test "queryAnchorRange returns dead selection when anchor is dead" {
 
         pub fn queryPosition(self: *const @This(), pos: u32) !queries.PositionInfo {
             _ = self;
-            return .{ .position = pos, .line = 0, .col = pos, .line_start = 0, .line_end = 0, .line_end_with_newline = 0 };
+            return .{
+                .position = pos,
+                .line = 0,
+                .col = pos,
+                .line_start = 0,
+                .line_end = 0,
+                .line_end_with_newline = 0,
+            };
         }
 
         pub fn graphemeCount(self: *const @This()) u32 {

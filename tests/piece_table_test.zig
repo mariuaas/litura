@@ -445,7 +445,10 @@ test "positionToLineCol and lineColToPosition round trip" {
     try std.testing.expectEqual(LineCol{ .line = 0, .col = 5 }, try table.positionToLineCol(5));
     try std.testing.expectEqual(LineCol{ .line = 1, .col = 0 }, try table.positionToLineCol(6));
     try std.testing.expectEqual(LineCol{ .line = 1, .col = 2 }, try table.positionToLineCol(8));
-    try std.testing.expectEqual(LineCol{ .line = 2, .col = 0 }, try table.positionToLineCol(table.graphemeCount()));
+    try std.testing.expectEqual(
+        LineCol{ .line = 2, .col = 0 },
+        try table.positionToLineCol(table.graphemeCount()),
+    );
 
     try std.testing.expectEqual(@as(u32, 8), try table.lineColToPosition(1, 2));
     try std.testing.expectEqual(@as(u32, 11), try table.lineColToPosition(1, 99));
@@ -464,7 +467,10 @@ test "newlineCountBefore validates positions and counts prefixes" {
     try std.testing.expectEqual(@as(u32, 1), try table.newlineCountBefore(2));
     try std.testing.expectEqual(@as(u32, 2), try table.newlineCountBefore(4));
     try std.testing.expectEqual(@as(u32, 3), try table.newlineCountBefore(table.graphemeCount()));
-    try std.testing.expectError(error.OutOfRange, table.newlineCountBefore(table.graphemeCount() + 1));
+    try std.testing.expectError(
+        error.OutOfRange,
+        table.newlineCountBefore(table.graphemeCount() + 1),
+    );
 }
 
 test "line navigation validates line bounds" {
@@ -493,7 +499,18 @@ test "grapheme cursor walks forward without materializing text" {
     try table.insert(table.graphemeCount(), " ef");
 
     var cursor = try table.graphemeCursor(0);
-    const expected = [_][]const u8{ "a", "\u{1F44B}\u{1F3FD}", " ", "b", "\n", "c", "d", " ", "e", "f" };
+    const expected = [_][]const u8{
+        "a",
+        "\u{1F44B}\u{1F3FD}",
+        " ",
+        "b",
+        "\n",
+        "c",
+        "d",
+        " ",
+        "e",
+        "f",
+    };
     var index: usize = 0;
     while (cursor.valid) {
         try std.testing.expect(index < expected.len);
@@ -607,7 +624,10 @@ test "find search is byte-exact over unicode grapheme clusters" {
     try std.testing.expectEqual(@as(?u32, 3), try table.findNext("\u{00E9}", 0));
     try std.testing.expectEqual(@as(?u32, 9), try table.findNext("e\u{0301}", 0));
     try std.testing.expectEqual(@as(?u32, 5), try table.findNext("\u{1F44B}\u{1F3FD}", 0));
-    try std.testing.expectEqual(@as(?u32, null), try table.findNext("\u{00E9}\u{1F44B}\u{1F3FD}", 4));
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        try table.findNext("\u{00E9}\u{1F44B}\u{1F3FD}", 4),
+    );
 }
 
 test "reinitialize reuses table cleanly" {

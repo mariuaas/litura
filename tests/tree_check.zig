@@ -54,7 +54,10 @@ fn checkNode(
             for (leaf.pieces.items) |piece| {
                 const piece_text = table.pieceText(piece);
                 try std.testing.expect(piece_text.len > 0);
-                try std.testing.expectEqualDeep(Summary.fromText(&table.seg, piece_text), piece.summary);
+                try std.testing.expectEqualDeep(
+                    Summary.fromText(&table.seg, piece_text),
+                    piece.summary,
+                );
                 try text.appendSlice(gpa, piece_text);
                 try piece_ends.append(gpa, text.items.len);
                 acc = Summary.merge(acc, piece.summary);
@@ -67,7 +70,16 @@ fn checkNode(
             for (internal.children.items) |child| {
                 const child_depth = depth + 1;
                 const child_summary =
-                    try checkNode(gpa, table, child, false, child_depth, leaf_depth, text, piece_ends);
+                    try checkNode(
+                        gpa,
+                        table,
+                        child,
+                        false,
+                        child_depth,
+                        leaf_depth,
+                        text,
+                        piece_ends,
+                    );
                 acc = Summary.merge(acc, child_summary);
             }
             try std.testing.expectEqualDeep(acc, internal.summary);

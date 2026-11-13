@@ -14,6 +14,9 @@ comptime {
     _ = @import("selection_test.zig");
     _ = @import("spans_test.zig");
     _ = @import("contracts_test.zig");
+    _ = @import("anchor_lifetime_test.zig");
+    _ = @import("interaction_test.zig");
+    _ = @import("observer_test.zig");
     _ = litura.engine;
     _ = litura.anchors;
     _ = litura.queries;

@@ -340,9 +340,9 @@ pub const TreeSitterTokenProvider = struct {
         };
     }
 
-    fn onBufferEvent(ptr: *anyopaque, _: *anyopaque, _: *anyopaque) void {
+    fn onBufferEvent(ptr: *anyopaque, _: *anyopaque, block: *anyopaque) void {
         const self: *TreeSitterTokenProvider = @ptrCast(@alignCast(ptr));
-        self.stale = true;
+        if (views.changesText(block)) self.stale = true;
     }
 
     fn tokenSpans(

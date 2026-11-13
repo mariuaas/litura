@@ -8,6 +8,8 @@ const views = litura.views;
 const BufferOp = litura.types.BufferOp;
 const InteractionOp = litura.types.InteractionOp;
 const Guard = litura.types.Guard;
+const support = @import("support.zig");
+const id = support.id;
 
 fn testProviderDeinitNoop(_: *anyopaque, _: std.mem.Allocator) void {}
 
@@ -139,7 +141,10 @@ test "engine reports registered view capabilities and states" {
     const capabilities = engine.queryCapabilities();
     try std.testing.expect(capabilities.symbol_capabilities == null);
     try std.testing.expectEqualStrings("tokens", capabilities.supported_views[3]);
-    try std.testing.expectEqual(views.ViewStateKind.available, engine.queryViewState("tokens").kind);
+    try std.testing.expectEqual(
+        views.ViewStateKind.available,
+        engine.queryViewState("tokens").kind,
+    );
     try std.testing.expectEqual(views.ViewStateKind.absent, engine.queryViewState("syntax").kind);
 }
 
@@ -305,7 +310,10 @@ test "registerViewProviders rejects conflicting batch during preflight" {
         }),
     );
 
-    try std.testing.expectEqual(views.ViewStateKind.available, engine.queryViewState("tokens").kind);
+    try std.testing.expectEqual(
+        views.ViewStateKind.available,
+        engine.queryViewState("tokens").kind,
+    );
     try std.testing.expectEqual(views.ViewStateKind.absent, engine.queryViewState("syntax").kind);
 }
 
@@ -358,13 +366,12 @@ test "buffer engine lifecycle flags track dirty undo and redo state" {
     try std.testing.expect(!engine.canUndo());
     try std.testing.expect(!engine.canRedo());
 
-    try engine.applyOps(&[_]BufferOp{.{ .insert = .{ .pos = 1, .text = "X" } }}, "test", "direct");
+    try support.edit(&engine, &[_]BufferOp{.{ .insert = .{ .pos = 1, .text = "X" } }});
     try std.testing.expect(engine.dirty());
     try std.testing.expect(engine.canUndo());
     try std.testing.expect(!engine.canRedo());
 
-    var undo_event = try engine.undo("system", "undo");
-    defer undo_event.deinit(std.testing.allocator);
+    try support.undo(&engine);
     try std.testing.expect(engine.canRedo());
 }
 
@@ -421,7 +428,7 @@ test "buffer engine save writes current text and clears dirty state" {
     var engine = try BufferEngine.initFromText(allocator, "alpha", null);
     defer engine.deinit();
 
-    try engine.applyOps(&[_]BufferOp{.{ .insert = .{ .pos = 5, .text = "!" } }}, "test", "direct");
+    try support.edit(&engine, &[_]BufferOp{.{ .insert = .{ .pos = 5, .text = "!" } }});
     try std.testing.expect(engine.dirty());
 
     try engine.save(path);
@@ -431,6 +438,17 @@ test "buffer engine save writes current text and clears dirty state" {
     const saved = try tmp.dir.readFileAlloc(std.testing.io, "saved.txt", allocator, .limited(1024));
     defer allocator.free(saved);
     try std.testing.expectEqualStrings("alpha!", saved);
+}
+
+test "a failed save keeps the stored path and saved revision" {
+    var engine = try BufferEngine.initFromText(std.testing.allocator, "alpha", "kept.txt");
+    defer engine.deinit();
+    try support.edit(&engine, &[_]BufferOp{.{ .insert = .{ .pos = 5, .text = "!" } }});
+
+    try std.testing.expect(std.meta.isError(engine.save("missing-directory/never/saved.txt")));
+    try std.testing.expectEqualStrings("kept.txt", engine.path.?);
+    try std.testing.expectEqual(@as(u32, 0), engine.saved_revision);
+    try std.testing.expect(engine.dirty());
 }
 
 test "buffer engine save without path fails" {
@@ -474,25 +492,38 @@ test "buffer engine search rejects empty query" {
     try std.testing.expectError(error.InvalidArgument, engine.findPrevious("", null));
 }
 
-test "buffer engine apply wraps buffer mutation submit" {
+test "a committed buffer mutation reports its revisions in its block" {
     var engine = try BufferEngine.initFromText(std.testing.allocator, "abc", null);
     defer engine.deinit();
 
-    var event = try engine.apply(&[_]BufferOp{.{ .insert = .{ .pos = 1, .text = "X" } }}, "user", "direct");
-    defer event.deinit(std.testing.allocator);
+    var block = try support.editBlock(
+        &engine,
+        &[_]BufferOp{.{ .insert = .{ .pos = 1, .text = "X" } }},
+    );
+    defer block.deinit(std.testing.allocator);
+    const event = block.transition.edit.?;
     try std.testing.expectEqual(@as(u32, 0), event.old_revision);
     try std.testing.expectEqual(@as(u32, 1), event.new_revision);
+    try std.testing.expectEqual(litura.events.EditClass.insert, event.edit_class);
 
     const text = try engine.getText();
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("aXbc", text);
 }
 
-test "buffer engine apply rejects empty operation list" {
+test "a buffer mutation without operations is rejected" {
     var engine = try BufferEngine.initFromText(std.testing.allocator, "abc", null);
     defer engine.deinit();
 
-    try std.testing.expectError(error.InvalidArgument, engine.apply(&[_]BufferOp{}, "user", "direct"));
+    var result = try engine.submit(
+        .{
+            .id = id,
+            .origin = engine.revision,
+            .payload = .{ .buffer_mutation = .{ .ops = &.{} } },
+        },
+    );
+    try support.expectRejected(&engine, &result, .invalid, "apply requires at least one operation");
+    try std.testing.expectEqual(@as(u64, 0), engine.next_sequence);
 }
 
 test "submit rejects stale buffer origin" {
@@ -500,15 +531,21 @@ test "submit rejects stale buffer origin" {
     defer engine.deinit();
 
     var result = try engine.submit(.{
-        .payload = .{ .buffer_mutation = .{ .ops = &[_]BufferOp{.{ .insert = .{ .pos = 1, .text = "x" } }} } },
+        .id = id,
+        .payload = .{
+            .buffer_mutation = .{ .ops = &[_]BufferOp{.{ .insert = .{ .pos = 1, .text = "x" } }} },
+        },
         .origin = 99,
     });
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
-        .validation_report => |report| {
+        .rejected => |report| {
             try std.testing.expectEqual(buffer_types.ValidationVerdict.stale, report.verdict);
-            try std.testing.expectEqualStrings("buffer revision 99 is stale; current revision is 0", report.message);
+            try std.testing.expectEqualStrings(
+                "buffer revision 99 is stale; current revision is 0",
+                report.message,
+            );
         },
         else => return error.TestUnexpectedResult,
     }
@@ -518,31 +555,38 @@ test "submit applies interaction mutation and bumps one revision" {
     var engine = try BufferEngine.initFromText(std.testing.allocator, "abc", null);
     defer engine.deinit();
 
-    const cursor = try engine.createAnchor(1, .sticky);
-    const session_id = try engine.createSession(&[_]anchors.AnchorId{cursor});
+    const session_id, const cursor = try support.caret(&engine, 1);
 
     var result = try engine.submit(.{
+        .id = id,
+        .origin = engine.revision,
         .payload = .{ .interaction_mutation = .{
             .session_id = session_id,
+            .origin = try engine.interactionRevision(session_id),
             .ops = &[_]InteractionOp{
-                .{ .move_cursor_anchor = .{ .cursor = cursor, .position = 2 } },
-                .{ .set_cursor_selection = .{ .cursor = cursor, .mark_position = 0 } },
+                .{
+                    .set_selections = .{
+                        .selections = &.{support.placeSpec(cursor, .{ .position = 2 }, null)},
+                    },
+                },
+                .{ .set_selections = .{ .selections = &.{
+                    support.placeSpec(cursor, .{ .anchor = cursor }, .{ .position = 0 }),
+                } } },
             },
         } },
     });
     defer result.deinit(std.testing.allocator);
 
-    switch (result) {
-        .interaction_result => |interaction| {
-            try std.testing.expectEqual(@as(u32, session_id), interaction.session_id);
-            try std.testing.expectEqual(@as(u32, 0), interaction.old_revision);
-            try std.testing.expectEqual(@as(u32, 1), interaction.new_revision);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+    const transition = result.committed.transition;
+    try std.testing.expectEqual(@as(?litura.events.EditEvent, null), transition.edit);
+    try std.testing.expectEqual(@as(usize, 1), transition.interactions.len);
+    const interaction = transition.interactions[0];
+    try std.testing.expectEqual(@as(u32, session_id), interaction.session);
+    try std.testing.expectEqual(@as(u32, 0), interaction.old_revision);
+    try std.testing.expectEqual(@as(u32, 1), interaction.new_revision);
 
     try std.testing.expectEqual(@as(?u32, 2), (try engine.queryAnchor(cursor)).position);
-    const mark = (try engine.querySessionMark(session_id, cursor)).?;
+    const mark = (try support.mark(&engine, session_id)).?;
     try std.testing.expectEqual(@as(?u32, 0), (try engine.queryAnchor(mark)).position);
 }
 
@@ -551,17 +595,21 @@ test "submit blocks guarded buffer mutation" {
     defer engine.deinit();
 
     const anchor_id = try engine.createAnchor(2, .weak);
-    try engine.applyOps(&[_]BufferOp{.{ .delete = .{ .start = 1, .end = 4 } }}, "test", "direct");
+    try support.edit(&engine, &[_]BufferOp{.{ .delete = .{ .start = 1, .end = 4 } }});
 
     const guards = [_]Guard{.{ .anchor_liveness = .{ .anchor = anchor_id } }};
     var result = try engine.submit(.{
-        .payload = .{ .buffer_mutation = .{ .ops = &[_]BufferOp{.{ .insert = .{ .pos = 0, .text = "x" } }} } },
+        .id = id,
+        .origin = engine.revision,
+        .payload = .{
+            .buffer_mutation = .{ .ops = &[_]BufferOp{.{ .insert = .{ .pos = 0, .text = "x" } }} },
+        },
         .guards = &guards,
     });
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
-        .validation_report => |report| {
+        .rejected => |report| {
             try std.testing.expectEqual(buffer_types.ValidationVerdict.anchor_dead, report.verdict);
             try std.testing.expectEqualStrings("anchor 1 is not live", report.message);
         },
@@ -574,6 +622,8 @@ test "submit undo replays inverse ops in reverse mutation order" {
     defer engine.deinit();
 
     var apply_result = try engine.submit(.{
+        .id = id,
+        .origin = engine.revision,
         .payload = .{ .buffer_mutation = .{ .ops = &[_]BufferOp{
             .{ .delete = .{ .start = 1, .end = 3 } },
             .{ .replace = .{ .start = 2, .end = 4, .text = "Z" } },
@@ -586,9 +636,10 @@ test "submit undo replays inverse ops in reverse mutation order" {
     try std.testing.expectEqualStrings("adZ", changed);
 
     var undo_result = try engine.submit(.{
+        .id = id,
+        .origin = engine.revision,
         .payload = .{ .undo = .{} },
-        .source = "system",
-        .cause = "undo",
+        .label = "undo",
     });
     defer undo_result.deinit(std.testing.allocator);
 
@@ -607,7 +658,7 @@ test "insert rebases anchors with stickiness" {
     const after_insert = try engine.createAnchor(2, .sticky);
 
     const ops = [_]BufferOp{.{ .insert = .{ .pos = 1, .text = "XY" } }};
-    try engine.applyOps(&ops, "test", "direct");
+    try support.edit(&engine, &ops);
 
     try std.testing.expectEqual(@as(?u32, 0), (try engine.queryAnchor(before_doc)).position);
     try std.testing.expectEqual(@as(?u32, 1), (try engine.queryAnchor(at_insert_weak)).position);
@@ -627,18 +678,18 @@ test "delete rebases and kills anchors" {
     const after_delete = try engine.createAnchor(5, .sticky);
 
     const ops = [_]BufferOp{.{ .delete = .{ .start = 2, .end = 4 } }};
-    try engine.applyOps(&ops, "test", "direct");
+    try support.edit(&engine, &ops);
 
     try std.testing.expectEqual(@as(?u32, 1), (try engine.queryAnchor(before_delete)).position);
     try std.testing.expectEqual(@as(?u32, 2), (try engine.queryAnchor(at_start)).position);
 
     const id_info = try engine.queryAnchor(inside_delete);
     try std.testing.expectEqual(@as(?u32, 2), id_info.position);
-    try std.testing.expectEqual(anchors.AnchorStatus.live, id_info.status);
+    try std.testing.expectEqual(anchors.HandleStatus.live, id_info.status);
 
     const idw_info = try engine.queryAnchor(inside_delete_weak);
     try std.testing.expectEqual(@as(?u32, null), idw_info.position);
-    try std.testing.expectEqual(anchors.AnchorStatus.dead, idw_info.status);
+    try std.testing.expectEqual(anchors.HandleStatus.dead, idw_info.status);
 
     try std.testing.expectEqual(@as(?u32, 2), (try engine.queryAnchor(at_end)).position);
     try std.testing.expectEqual(@as(?u32, 3), (try engine.queryAnchor(after_delete)).position);
@@ -654,7 +705,7 @@ test "multi op apply rebases anchors sequentially" {
         .{ .insert = .{ .pos = 0, .text = "x" } },
         .{ .delete = .{ .start = 1, .end = 2 } },
     };
-    try engine.applyOps(&ops, "test", "direct");
+    try support.edit(&engine, &ops);
 
     const text = try engine.getText();
     defer std.testing.allocator.free(text);
@@ -671,14 +722,20 @@ test "dead anchors are inert under later edits" {
     const anchor_id = try engine.createAnchor(2, .weak);
 
     const ops = [_]BufferOp{.{ .delete = .{ .start = 1, .end = 4 } }};
-    try engine.applyOps(&ops, "test", "direct");
+    try support.edit(&engine, &ops);
 
-    try std.testing.expectEqual(anchors.AnchorStatus.dead, (try engine.queryAnchor(anchor_id)).status);
+    try std.testing.expectEqual(
+        anchors.HandleStatus.dead,
+        (try engine.queryAnchor(anchor_id)).status,
+    );
 
     const ops2 = [_]BufferOp{.{ .insert = .{ .pos = 0, .text = "XYZ" } }};
-    try engine.applyOps(&ops2, "test", "direct");
+    try support.edit(&engine, &ops2);
 
-    try std.testing.expectEqual(anchors.AnchorStatus.dead, (try engine.queryAnchor(anchor_id)).status);
+    try std.testing.expectEqual(
+        anchors.HandleStatus.dead,
+        (try engine.queryAnchor(anchor_id)).status,
+    );
 }
 
 test "undo delete resurrects weak anchors from deletion metadata" {
@@ -688,27 +745,30 @@ test "undo delete resurrects weak anchors from deletion metadata" {
     const weak_anchor = try engine.createAnchor(3, .weak);
 
     const ops = [_]BufferOp{.{ .delete = .{ .start = 2, .end = 4 } }};
-    var event = try engine.apply(&ops, "test", "direct");
-    defer event.deinit(std.testing.allocator);
+    try support.edit(&engine, &ops);
 
     try std.testing.expectEqual(@as(usize, 1), engine.undo_stack.items.len);
     try std.testing.expectEqual(@as(usize, 1), engine.undo_stack.items[0].deletion_metas.len);
-    try std.testing.expectEqual(anchors.AnchorStatus.dead, (try engine.queryAnchor(weak_anchor)).status);
+    try std.testing.expectEqual(
+        anchors.HandleStatus.dead,
+        (try engine.queryAnchor(weak_anchor)).status,
+    );
 
-    var undo_event = try engine.undo("system", "undo");
-    defer undo_event.deinit(std.testing.allocator);
+    try support.undo(&engine);
 
     const resurrected = try engine.queryAnchor(weak_anchor);
-    try std.testing.expectEqual(anchors.AnchorStatus.live, resurrected.status);
+    try std.testing.expectEqual(anchors.HandleStatus.live, resurrected.status);
     try std.testing.expectEqual(@as(?u32, 3), resurrected.position);
-    try std.testing.expectEqual(anchors.AnchorStickiness.weak, resurrected.stickiness);
+    try std.testing.expectEqual(@as(?anchors.AnchorStickiness, .weak), resurrected.stickiness);
 
     try std.testing.expectEqual(@as(usize, 1), engine.redo_stack.items.len);
     try std.testing.expectEqual(@as(usize, 0), engine.redo_stack.items[0].deletion_metas.len);
 
-    var redo_event = try engine.redo("system", "redo");
-    defer redo_event.deinit(std.testing.allocator);
-    try std.testing.expectEqual(anchors.AnchorStatus.dead, (try engine.queryAnchor(weak_anchor)).status);
+    try support.redo(&engine);
+    try std.testing.expectEqual(
+        anchors.HandleStatus.dead,
+        (try engine.queryAnchor(weak_anchor)).status,
+    );
 }
 
 test "undo replace resurrects weak anchors inside replaced span" {
@@ -718,19 +778,20 @@ test "undo replace resurrects weak anchors inside replaced span" {
     const weak_anchor = try engine.createAnchor(3, .weak);
 
     const ops = [_]BufferOp{.{ .replace = .{ .start = 2, .end = 4, .text = "XY" } }};
-    var event = try engine.apply(&ops, "test", "direct");
-    defer event.deinit(std.testing.allocator);
+    try support.edit(&engine, &ops);
 
-    try std.testing.expectEqual(anchors.AnchorStatus.dead, (try engine.queryAnchor(weak_anchor)).status);
+    try std.testing.expectEqual(
+        anchors.HandleStatus.dead,
+        (try engine.queryAnchor(weak_anchor)).status,
+    );
     try std.testing.expectEqual(@as(usize, 1), engine.undo_stack.items[0].deletion_metas.len);
 
-    var undo_event = try engine.undo("system", "undo");
-    defer undo_event.deinit(std.testing.allocator);
+    try support.undo(&engine);
 
     const resurrected = try engine.queryAnchor(weak_anchor);
-    try std.testing.expectEqual(anchors.AnchorStatus.live, resurrected.status);
+    try std.testing.expectEqual(anchors.HandleStatus.live, resurrected.status);
     try std.testing.expectEqual(@as(?u32, 3), resurrected.position);
-    try std.testing.expectEqual(anchors.AnchorStickiness.weak, resurrected.stickiness);
+    try std.testing.expectEqual(@as(?anchors.AnchorStickiness, .weak), resurrected.stickiness);
 }
 
 test "multi-delete commit retains one deletion meta per deleted span" {
@@ -744,22 +805,26 @@ test "multi-delete commit retains one deletion meta per deleted span" {
         .{ .delete = .{ .start = 1, .end = 3 } },
         .{ .delete = .{ .start = 2, .end = 4 } },
     };
-    var event = try engine.apply(&ops, "test", "direct");
-    defer event.deinit(std.testing.allocator);
+    try support.edit(&engine, &ops);
 
     try std.testing.expectEqual(@as(usize, 2), engine.undo_stack.items[0].deletion_metas.len);
-    try std.testing.expectEqual(anchors.AnchorStatus.dead, (try engine.queryAnchor(c_anchor)).status);
-    try std.testing.expectEqual(anchors.AnchorStatus.dead, (try engine.queryAnchor(f_anchor)).status);
+    try std.testing.expectEqual(
+        anchors.HandleStatus.dead,
+        (try engine.queryAnchor(c_anchor)).status,
+    );
+    try std.testing.expectEqual(
+        anchors.HandleStatus.dead,
+        (try engine.queryAnchor(f_anchor)).status,
+    );
 
-    var undo_event = try engine.undo("system", "undo");
-    defer undo_event.deinit(std.testing.allocator);
+    try support.undo(&engine);
 
     const c_info = try engine.queryAnchor(c_anchor);
-    try std.testing.expectEqual(anchors.AnchorStatus.live, c_info.status);
+    try std.testing.expectEqual(anchors.HandleStatus.live, c_info.status);
     try std.testing.expectEqual(@as(?u32, 2), c_info.position);
 
     const f_info = try engine.queryAnchor(f_anchor);
-    try std.testing.expectEqual(anchors.AnchorStatus.live, f_info.status);
+    try std.testing.expectEqual(anchors.HandleStatus.live, f_info.status);
     try std.testing.expectEqual(@as(?u32, 5), f_info.position);
 }
 
@@ -767,38 +832,41 @@ test "undo insert and redo" {
     var engine = try BufferEngine.initFromText(std.testing.allocator, "abc", null);
     defer engine.deinit();
 
-    const ops = [_]BufferOp{.{ .insert = .{ .pos = 1, .text = "X" } }};
-    const original = try engine.apply(&ops, "test", "direct");
-    defer @constCast(&original).deinit(std.testing.allocator);
-    const original_new_revision = original.new_revision;
-
-    const undo_event = try engine.undo("system", "undo");
-    defer @constCast(&undo_event).deinit(std.testing.allocator);
-    const text1 = try engine.getText();
-    defer std.testing.allocator.free(text1);
-    try std.testing.expectEqualStrings("abc", text1);
+    try support.edit(&engine, &.{.{ .insert = .{ .pos = 1, .text = "X" } }});
+    var undone = try engine.submit(
+        .{
+            .id = .{ .value = 41 },
+            .origin = engine.revision,
+            .payload = .{ .undo = .{} },
+            .label = "undo",
+        },
+    );
+    defer undone.deinit(std.testing.allocator);
+    try support.expectText(&engine, "abc");
     try std.testing.expectEqual(@as(u32, 2), engine.revision);
-    try std.testing.expectEqualStrings("undo", undo_event.cause);
+    try std.testing.expectEqual(@as(u128, 41), undone.committed.transition.intent.value);
+    try std.testing.expectEqualStrings("undo", undone.committed.transition.label.?);
     try std.testing.expectEqual(@as(usize, 0), engine.undo_stack.items.len);
     try std.testing.expectEqual(@as(usize, 1), engine.redo_stack.items.len);
 
-    const redo_event = try engine.redo("system", "redo");
-    defer @constCast(&redo_event).deinit(std.testing.allocator);
-    const text2 = try engine.getText();
-    defer std.testing.allocator.free(text2);
-    try std.testing.expectEqualStrings("aXbc", text2);
+    try support.redo(&engine);
+    try support.expectText(&engine, "aXbc");
     try std.testing.expectEqual(@as(u32, 3), engine.revision);
-    try std.testing.expectEqualStrings("redo", redo_event.cause);
     try std.testing.expectEqual(@as(usize, 1), engine.undo_stack.items.len);
     try std.testing.expectEqual(@as(usize, 0), engine.redo_stack.items.len);
-    try std.testing.expectEqual(@as(u32, 1), original_new_revision);
 }
 
 test "undo redo empty rejects" {
     var engine = try BufferEngine.initFromText(std.testing.allocator, "abc", null);
     defer engine.deinit();
 
-    try std.testing.expectError(error.InvalidArgument, engine.undo("system", "undo"));
-    try std.testing.expectError(error.InvalidArgument, engine.redo("system", "redo"));
+    var undo = try engine.submit(
+        .{ .id = id, .origin = engine.revision, .payload = .{ .undo = .{} } },
+    );
+    try support.expectRejected(&engine, &undo, .invalid, "nothing to undo");
+    var redo = try engine.submit(
+        .{ .id = id, .origin = engine.revision, .payload = .{ .redo = .{} } },
+    );
+    try support.expectRejected(&engine, &redo, .invalid, "nothing to redo");
     try std.testing.expectEqual(@as(u32, 0), engine.revision);
 }

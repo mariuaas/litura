@@ -19,6 +19,26 @@ interaction state.
 Any such behavior must be representable, observable, and interceptable through
 the same public evaluation, intent, and event machinery available to extensions.
 
+**Declared requests (normative):** every state change enters through a declared
+public request. Document and interaction changes are intents (§4.2). The
+intrinsic requests are exactly `create_anchor`, `drop_anchor` (§1.4),
+`create_session` and `drop_session` (§2.6.3). An engine offers no other way to
+change protocol-visible state; in particular, no public function moves an
+anchor or edits a session outside an intent.
+
+**Interception is host-mediated (normative):** requests are inspectable data
+values, so a host can route intents and intrinsic requests through a pipeline in
+which extensions observe, transform, reorder or refuse them before they reach
+the engine. The responsibilities divide: the engine makes every request an
+inspectable value, provides no privileged bypass, gives each request a defined
+effect on state and on the event stream (§7), and keeps notification read-only
+(a component notified of a published block cannot change engine state). The
+host provides the interception pipeline itself. The existence of request types
+does not by itself give any extension an interception hook; an engine
+conforms to this section when the host exposes that pipeline. Routing an
+intrinsic request through it does not make the request an editing command:
+session teardown, for instance, records no history.
+
 Host-owned embedded UI surfaces that do not operate over shared protocol objects
 are non-reflective interfaces. They are outside the protocol boundary and must
 not participate in synchronous evaluation, guard validation, or atomic
@@ -159,11 +179,14 @@ RangeStatus =
 Anchors are engine-managed durable references. They persist across revisions and
 are rebased deterministically by the engine.
 
-`AnchorRange` and `RangeStatus` are derived interaction/editor-layer
-interpretations over anchor ids, not intrinsic engine-managed objects. The
-engine owns anchor creation, rebasing, lifecycle, and query. Pairing anchors
-into selections or regions and interpreting the result as `Live`, `Collapsed`,
-`Degenerate`, or `Dead` occurs above the intrinsic engine boundary.
+`AnchorRange` and `RangeStatus` are interpretations over anchor ids, not
+intrinsic engine-managed objects. The engine owns anchor creation, rebasing,
+lifecycle, and query. Interpreting a pair as `Live`, `Collapsed`, `Degenerate`,
+or `Dead` orders its endpoints by position. For a session's selections, whose
+endpoints the session owns (§2.6), `start` and `end` are slots rather than an
+order: rebasing can move a selection's `start` past its `end`, and the derived
+status still orders positions geometrically while the active edge keeps
+identifying the point.
 
 Anchor resurrection is not modeled on the anchor itself. It is driven
 exclusively by the undo system (see §1.6).
@@ -422,6 +445,44 @@ AnchorReceipt = {
 drop_anchor(buffer, anchor_id) -> ()
 ```
 
+**Handle states (normative):** a client's `AnchorId` refers to exactly one of:
+
+| State | Meaning | `query_anchor` | `drop_anchor` |
+|---|---|---|---|
+| Live | Exists and has a position | `Live`, position | Disposes it |
+| Dead | Exists, has no position | `Dead` | Disposes it |
+| Disposed | Its owner ended its lifetime | `Disposed` | No-op, succeeds |
+| Invalid | Never issued as a public anchor | error | error |
+
+`Dead` describes the absence of a position. It does not promise that any
+reachable undo entry can still resurrect the anchor, and engines do not expose
+resurrection eligibility in v0.1. `Disposed` is terminal. `Invalid` covers
+identifiers nobody was given, including every internal anchor's.
+
+**Issuance (normative):** a public anchor identity is issued only when the
+receipt or event block (§7) that creates it is published. Preparation may assign
+provisional identities, but a preparation that is abandoned, whether rejected
+or failed, leaves the issued-identity boundary unchanged and exposes none of
+them. The boundary is the transaction, so two cases differ:
+
+- An endpoint created and released while one transition is prepared, in a single
+  interaction mutation or across the parts of a composite, exists only in
+  provisional state. It never appears in a published block and is never issued.
+- An endpoint published by one transition and released by a later one is
+  issued, then terminal: the first block shows its creation, the later one its
+  release, and queries afterwards report it `Disposed`.
+
+Every issued identity therefore appears in some receipt or published block, and
+an engine can tell a disposed identity from an invalid one without retaining a
+record per disposal.
+
+A session's selection endpoints are public anchors owned by the session (§2.6).
+`drop_anchor` refuses them with an explicit error rather than leaving the
+session referring to nothing; they are released by the session's own
+interaction mutations or by `drop_session`. The creation, disposal and passive
+movement of client-created anchors are outside the event stream (§7.3); their
+creator holds the receipt and can query them.
+
 If the requested position was deleted between `origin_revision` and
 `head_revision`, the engine returns a valid `AnchorId` initialized with `status:
 Dead`. The extension discovers this through the receipt and can decide whether
@@ -436,6 +497,24 @@ A `Dead` anchor may not be used as a mutation target. It may be queried (returns
 buffer and must not be reused, even after the anchor is dropped or reclaimed by
 GC. Engines that compact anchor storage must preserve identity, not recycle
 identifiers.
+
+**Disposal rule (normative):** `drop_anchor` is terminal. No later operation,
+including an undo or redo whose `DeletionMeta` (§2.5.2) recorded the anchor,
+may bring a dropped anchor back. Undo restores the text and resurrects the
+other anchors of that deletion; the dropped anchor stays gone. This is a
+separate guarantee from the identity rule: non-reuse says the identifier will
+never name a different anchor, while disposal says it will never name this one
+again.
+
+**Internal anchors (normative):** an engine may create anchors for its own
+bookkeeping, such as the `target_anchor` of a deletion (§2.5.2) or anchors that
+carry a buffer operation's result through later operations in the same
+payload. These are not part of the public anchor namespace. Anchor queries,
+`drop_anchor`, guards, anchor position references and selection targets treat
+an internal anchor's identifier as unknown, even if a caller guesses it, and an
+internal identifier is never one a client could have been issued. Internal
+anchors still rebase like any other anchor. An internal anchor lives exactly as
+long as the engine needs it; how the engine tracks that is not specified.
 
 ### 1.5 Summary Algebra
 
@@ -551,9 +630,11 @@ the client (which hosts the UI and extensions).
 | Message | Semantics |
 |---|---|
 | `EvalRequest` | Initiates synchronous, isolated, bounded execution |
-| `SubmitIntent` | Submits an asynchronous state transition request |
-| `CreateAnchor` | Synchronous anchor creation (intrinsic operation) |
-| `DropAnchor` | Synchronous anchor destruction (intrinsic operation) |
+| `SubmitIntent` | Submits a state transition request |
+| `CreateAnchor` | Synchronous anchor creation (intrinsic request) |
+| `DropAnchor` | Synchronous anchor disposal (intrinsic request) |
+| `CreateSession` | Synchronous session creation (intrinsic request, §2.6.3) |
+| `DropSession` | Synchronous session teardown (intrinsic request, §2.6.3) |
 
 **Outbound messages (Engine → Client):**
 
@@ -561,9 +642,8 @@ the client (which hosts the UI and extensions).
 |---|---|
 | `EvalResponse` | Synchronous result of an `EvalRequest` |
 | `AnchorReceipt` | Synchronous result of a `CreateAnchor` |
-| `ValidationReport` | Asynchronous rejection of a `SubmitIntent` |
-| `EditEvent` | Asynchronous broadcast of a canonical buffer transition |
-| `InteractionEvent` | Asynchronous broadcast of a canonical session transition |
+| `ValidationReport` | Rejection of a `SubmitIntent`; publishes nothing |
+| `Block` | The canonical record of one committed intent or session request, returned at commit and delivered to other subscribers by the host (§7) |
 
 **Tier 1 intrinsic queries** (`query_capabilities`, `query_position`,
 `query_line`, `query_bracket_match`, `query_summary`, `query_anchor`) are
@@ -870,8 +950,13 @@ EngineCapabilities = {
     apply_policies        : ApplyPolicySet
     program_carriers      : ProgramCarrierProfile[]
     rebase_policy         : RebasePolicy      -- §6.2
+    sequencing            : Sequencing        -- §6.1
     limits                : EngineLimits
 }
+
+Sequencing =
+    | Queued         -- pending intents ordered by priority, then registration
+    | Synchronous    -- each submission applied when made; no priority accepted
 
 SymbolCapabilities = {
     definition : bool
@@ -910,8 +995,8 @@ must be `"CanonicalAWU"`, indicating compatibility with the abstract cost model
 defined in §5.3.
 
 **Normative constraint:** `supported_views`, `summary_registry`,
-`supported_group_modes`, `apply_policies`, `program_carriers`, and
-`rebase_policy` together define the complete protocol-visible optional feature
+`supported_group_modes`, `apply_policies`, `program_carriers`, `rebase_policy`,
+and `sequencing` together define the complete protocol-visible optional feature
 surface of the engine. A
 client must not be required to infer support for any optional feature through
 failed speculative requests alone.
@@ -1010,9 +1095,14 @@ DeadAnchorRecord = {
 }
 ```
 
+A record may name a public anchor or the `target_anchor` of an earlier
+deletion, which must survive for that deletion's own undo. Anchors scoped to a
+single transaction are never recorded: they no longer exist when any undo could
+run.
+
 **Constraints:**
 
-- Exactly one hidden live anchor (`target_anchor`) per deletion unit, placed at
+- Exactly one internal live anchor (`target_anchor`, §1.4) per deletion unit, placed at
     the realized splice's `start` with `Weak` stickiness. This anchor
     participates in normal rebasing and tracks coordinate drift from
     intervening edits. The splice start is used rather than the requested
@@ -1027,26 +1117,38 @@ DeadAnchorRecord = {
 
 ### 2.5.3 Undo Application
 
-When an `UndoEntry` is applied:
+When an `UndoEntry` is applied, its `inverse_ops` run in reverse order of the
+original operations, as one buffer mutation that advances the revision once.
+For each inverse operation that restores a deletion:
 
-1. Resolve `target_anchor` position: `pos ← query_position(target_anchor)`.
-2. Apply `inverse_ops` sequentially at `pos`. This is a standard buffer mutation
-   that advances the revision.
-3. For each `DeadAnchorRecord` in `deletion_meta.dead_anchors`: resurrect the
-    anchor at `pos + offset` with its original `stickiness`, transitioning it
-    from `Dead` to `Live`.
-4. Destroy `target_anchor` (the hidden tracking anchor is no longer needed).
+1. Apply the inverse operation, restoring the deleted text at the position of
+   that deletion's `target_anchor`, `pos`.
+2. For each `DeadAnchorRecord` in its `dead_anchors`: resurrect the anchor at
+    `pos + offset` with its original `stickiness`, transitioning it from `Dead`
+    to `Live`. A record naming a public anchor that was dropped is skipped
+    (§1.4).
+3. Destroy `target_anchor` (the internal tracking anchor is no longer needed).
+
+Only then does the next inverse operation run. The offsets describe the text
+immediately after this inverse operation, and a later inverse operation can
+both move the resurrected anchors and need one of them: when the second of two
+deletions in one entry covers the first deletion's `target_anchor`, undoing the
+second must resurrect that target before the first can be undone.
+
+A missing or dead `target_anchor`, or a missing internal anchor named by a
+record, means the engine's history is inconsistent. The undo then fails as a
+whole and has no effect; it is not treated as a disposal to skip.
 
 Resurrection is atomic with the undo mutation. Extensions observe the anchor
 transition from `Dead` to `Live` in the same revision step as the text
 restoration.
 
 **Intent routing:** Undo application is triggered by an `Undo` intent payload
-(§4.2), not by an engine-internal bypass. The resulting `EditEvent` carries
-`cause: Intent { id }` (the `IntentId` of the undo intent) and `source:
-UserInput` (if user-initiated) or `source: Extension { id }` (if
-extension-initiated). This ensures undo is speculative-queue-compatible and
-observable by all subscribers.
+(§4.2), not by an engine-internal bypass. The resulting block (§7) echoes the
+undo intent's `IntentId` and has `source: UserInput` (if user-initiated) or
+`source: Extension { id }` (if extension-initiated), and its edit event lists
+every session endpoint the undo revived (§7.1). This ensures undo is
+speculative-queue-compatible and observable by all subscribers.
 
 ### 2.5.4 Resurrection Rule (Strict)
 
@@ -1083,14 +1185,20 @@ Deletion metadata lifetime is tied to undo/redo reachability:
 
 - When an `UndoEntry` becomes unreachable (e.g., new edits after an undo discard
   the redo branch), its `DeletionMeta` may be reclaimed.
-- Dead anchors whose `DeletionMeta` has been reclaimed are truly terminal and
-  may be dropped.
+- A public anchor named by reclaimed metadata loses only its resurrection path.
+  It stays `Dead` until its owner disposes of it: its client, or the session
+  whose selection holds it. Reclamation never disposes of a public anchor and
+  never changes a session's selections.
+- Internal anchors (§1.4), such as deletion targets, may be reclaimed once no
+  reachable entry needs them. A target can be needed by an entry other than
+  the one that created it: the edit that discards a redo branch can kill one
+  of that branch's targets and record it for its own undo.
 - Engines may coalesce adjacent deletions, compress interval metadata, and drop
   unreachable entries aggressively, provided undo correctness and anchor
   resurrection semantics are preserved.
 
-GC may reclaim anchor storage and metadata, but it does not permit `AnchorId`
-reuse.
+Reclamation therefore changes nothing a client can observe and produces no
+event. It does not permit `AnchorId` reuse.
 
 ---
 
@@ -1110,12 +1218,12 @@ Session = {
 InteractionRevision = nat
 
 Selection = {
-    range  : AnchorRange
+    range  : AnchorRange      -- endpoint slots; equal ids form a caret
     active : Start | End      -- dynamic edge (point) vs fixed edge (mark)
 }
 
 InteractionState = {
-    selections : Selection[]
+    selections : Selection[]  -- never empty
     registers  : map<string, InteractionValue>
 }
 
@@ -1129,14 +1237,37 @@ InteractionValue =
 sessions (split views, indirect buffers, transient contexts) are a future
 extension. The coupling is intentionally minimal.
 
-`Selection` is interaction/session state, not intrinsic engine state. The
-engine owns anchor rebasing and anchor query. The session/editor layer owns the
-pairing of anchors into selections, the active-edge interpretation, and the
-derived range status over paired anchors.
+**Ownership (normative):** a session owns the anchors that form its selections,
+its endpoints. Any client can query them, but only the session's own
+interaction mutations change which anchors form its selections, where they are
+placed explicitly, and their active edges; `drop_session` releases all of them.
+Released endpoints are disposed (§1.4), so undo never revives them. Ownership
+never transfers: a client-created anchor can supply a position for a selection
+(§2.6.1) but never becomes an endpoint, and an endpoint never becomes a client
+anchor.
+
+**Selection identity (normative):** a selection is identified by its endpoint
+anchors. A caret is a selection whose two slots name the same anchor. A
+selection whose fixed endpoint is `Dead` is degenerate (§1.4); it keeps that
+endpoint, and so remains eligible for its resurrection, until the session
+itself changes the selection. A host may display a degenerate selection as a
+caret; the engine does not rewrite it.
+
+**Stickiness of endpoints (normative v0.1 policy):** the active endpoint of a
+selection is `Sticky`, its fixed endpoint `Weak`, and a caret's anchor
+`Sticky`. The engine assigns stickiness when a selection is installed, so an
+interaction mutation that exchanges point and mark exchanges the stickiness of
+the two live anchors. The rationale in §1.4 motivates this choice ("cursor-like
+anchors can remain spatially continuous through deletion while mark-like
+anchors can still die") without requiring it of every selection model; v0.1
+adopts it so that ordinary selections behave predictably. Because a `Sticky`
+anchor never dies, only fixed endpoints can be `Dead`, and a dead endpoint
+cannot change role. Anchors created independently of sessions keep the
+stickiness their creator chose.
 
 **Normative constraint (interaction revision):** `InteractionRevision` versions
-interaction state: which anchors form selections, their active edges, and
-register contents. It advances only when interaction state is explicitly
+interaction state: which anchors form selections, their explicit placement,
+their active edges, and register contents. It advances only when interaction state is explicitly
 mutated (an applied `InteractionMutation`, or the interaction part of a
 `Composite`). Passive anchor rebasing caused by buffer edits, including undo,
 redo and lineage resurrection, never advances it. An anchor's position is a
@@ -1174,10 +1305,65 @@ BufferOp =
     | Replace { target: Range | AnchorRange, text: byte[] }
 
 InteractionOp =
-    | SetSelections { selections: Selection[] }
+    | SetSelections { selections: SelectionSpec[] }
     | WriteRegister { key: string, value: InteractionValue }
     | ClearRegister { key: string }
+
+SelectionSpec = {
+    start  : Endpoint
+    end    : Endpoint | SameAsStart     -- SameAsStart: a caret
+    active : Start | End
+}
+
+Endpoint =
+    | Keep(AnchorId)                     -- an endpoint this session owns; unchanged
+    | Move(AnchorId, Target)             -- same endpoint, new position; must be live
+    | New(Target)                        -- a fresh endpoint anchor
+
+Target =
+    | Position(Position)                 -- coordinate-bearing
+    | Edit(EditRef)                      -- composites only (below)
+    | AnchorPosition(AnchorId)           -- a live public anchor's position; anchor-scoped
 ```
+
+`SetSelections` replaces the session's selection list. Each endpoint states how
+it relates to the current state:
+
+- **Keep** preserves an owned endpoint's identity and geometric state: its
+  position and status, including `Dead`. Its stickiness follows its role in the
+  new selection (§2.6). A dead endpoint may be kept only as the fixed endpoint
+  of a non-caret selection.
+- **Move** preserves an owned endpoint's identity at a new position. The
+  endpoint must be live. A moved endpoint can never be pulled back by an older
+  deletion record, since deletion records name only dead anchors.
+- **New** creates a fresh endpoint. It receives a public identity when its
+  transition is published, and only if it is still part of a selection then; an
+  endpoint released again within the same transition is never issued (§1.4).
+  A later operation in the same intent therefore cannot name it.
+
+Every target samples a position: none creates a relationship with what it
+names. `Position` is coordinate-bearing; `AnchorPosition` is anchor-scoped and
+follows liveness and guard semantics, and may name any live public anchor,
+including another session's endpoint.
+
+**Normative constraint (replacement):** each owned anchor appears at most once
+in the new list, except that a caret's single anchor fills both slots;
+`Keep` and `Move` name only the session's current endpoints; the list is not
+empty. Every current endpoint the list does not mention is released, which is
+terminal (§1.4).
+
+**Normative constraint (simultaneous resolution):** every endpoint reference
+and target in one `SetSelections` is resolved against the same pre-operation
+state: the state left by the preceding buffer operations and preceding
+interaction operations of the same intent. Only after the whole replacement
+resolves and validates is it installed. In particular, an endpoint the new list
+omits can still be sampled, and it is released afterwards; and with carets `a`
+at 3 and `b` at 9, `[Move(a, AnchorPosition(b)), Move(b, AnchorPosition(a))]`
+leaves `a` at 9 and `b` at 3, independent of list order. Separate interaction
+operations remain sequential: each sees the state the previous one prepared.
+
+`WriteRegister` and `ClearRegister` change the session's registers. Keys and
+values are copied into the session.
 
 The full `IntentPayload` type (including `BufferMutation`,
 `InteractionMutation`, `Composite`, `Undo`, and `Redo` variants) is defined in
@@ -1192,17 +1378,18 @@ The entire composite application is atomic — if either phase fails, neither
 takes effect.
 
 Origins, guards and the interaction CAS are checked against the pre-application
-snapshot. Positions carried by `interaction_ops` address the text produced by
-`buffer_ops`. Because that text's grapheme count cannot be predicted from the
+snapshot. `interaction_ops` are then prepared in order, each against the state
+the previous one prepared; publication happens only when all of them, and the
+whole event block (§7), are ready. Positions carried by `interaction_ops`
+address the text produced by `buffer_ops`. Because that text's grapheme count cannot be predicted from the
 requested operations (§1.4), those positions are validated against the
 produced state, with the atomicity of §4.1.
 
-**Symbolic edit references (normative).** Within a `Composite`, an interaction
-operation may designate a position by reference to the realized result of one
-of its buffer operations, instead of computing that position itself:
+**Symbolic edit references (normative).** Within a `Composite`, a selection
+target may designate a position by reference to the realized result of one of
+its buffer operations, instead of computing that position itself:
 
 ```
-InteractionTarget = Position | EditRef
 
 EditRef = {
     op   : nat          -- index into the Composite's buffer_ops, in order
@@ -1241,27 +1428,72 @@ non-overlapping optimization available.
 
 ```
 InteractionEvent = {
-    session       : SessionId
-    buffer        : BufferId
-    cause         : TransactionCause
-    old_revision  : InteractionRevision
-    new_revision  : InteractionRevision
-    changed       : InteractionDelta[]
-    source        : EventSource
+    session           : SessionId
+    document_revision : Revision
+    old_revision      : InteractionRevision
+    new_revision      : InteractionRevision
+    selections        : SelectionsChanged | None
+    registers         : RegisterChanged[]
 }
 
-InteractionDelta =
-    | SelectionsChanged { old: Selection[], new: Selection[] }
-    | RegisterChanged   { 
-        key: string, 
-        old: InteractionValue | None,
-        new: InteractionValue | None 
-    }
+SelectionsChanged = { old: SelectionValue[], new: SelectionValue[] }
+
+SelectionValue = {
+    start  : EndpointValue
+    end    : EndpointValue
+    active : Start | End
+}
+
+EndpointValue = { anchor: AnchorId, position: Position | Dead }
+
+RegisterChanged = {
+    key : string,
+    old : InteractionValue | None,
+    new : InteractionValue | None
+}
 ```
 
-Interaction events are delivered in `InteractionRevision` order. They are
-sequenced alongside `EditEvent`s in a unified event stream, maintaining causal
-ordering between buffer mutations and interaction state changes.
+A committed intent's block contains one `InteractionEvent` per session its
+interaction mutations changed, in order of first change (§7). The event states
+the session's net change over the whole transition: `old` is the session's
+state after the edit's passive effects and before any explicit change, and `new`
+its final state. States between the mutations of one intent are never
+published; the intent is atomic, so no observer could have seen them. Each
+interaction mutation still advances the interaction revision once, so
+`old_revision` and `new_revision` can differ by more than one. Positions are at
+`document_revision`, the revision after the block's edit if there is one. The
+difference between `old` and `new` is exactly the explicit change: passive
+rebasing never appears as an interaction event, and an edit event explains it
+(§7.1). Because endpoint values carry identities, a
+delta shows which endpoints were kept, moved, created or released, and which
+role each has. `selections` is `None` and `registers` empty when the session
+ends the transition as it started.
+
+### 2.6.3 Session Lifecycle
+
+```
+create_session(selections: SelectionSpec[], origin: Revision) -> Block
+drop_session(session: SessionId) -> Block
+```
+
+Session creation and teardown are intrinsic requests (§0.1). They advance no
+document or interaction revision and record no history, but each publishes a
+lifecycle block (§7). `create_session` accepts only `New` endpoints with
+`Position` or `AnchorPosition` targets; the new session starts at interaction
+revision 0, and its block carries its identity and initial selections.
+`drop_session` releases every endpoint and register of the session atomically.
+
+**Intrinsic request failures (normative):** `create_anchor`, `drop_anchor`,
+`create_session` and `drop_session` fail synchronously with a typed error to the
+requester, not with a `ValidationReport`. A report is the rejection of an
+intent: it carries the guard evaluations and verdict that a speculative intent
+queue reconciles against (§7.6), and intrinsic requests have neither guards nor
+a place in that queue. The error kinds are: a malformed request (an empty
+selection list, an endpoint other than `New`, an edit reference, or an anchor
+target that is not live), a position out of range, a stale origin, an unknown
+session or never-issued anchor identifier, an attempt to drop a session's
+endpoint, and resource exhaustion. A failed request publishes nothing, consumes
+no sequence number and issues no identity.
 
 ---
 
@@ -1517,13 +1749,24 @@ Intent = {
     payload    : IntentPayload
     guards     : Guard[]
     source     : IntentSource
+    label      : string | None
     priority   : int
 }
+
+IntentId = u128
 ```
 
-`IntentId` must be a globally unique identifier (e.g., UUIDv4) generated by the
-submitting client. The engine treats `IntentId` as an opaque correlation token
-for acknowledgment and rejection routing.
+`IntentId` is mandatory and opaque: a 128-bit value the submitting client
+supplies (a random UUID is one choice). The engine echoes it in the resulting
+block or report and never interprets, deduplicates or checks it for
+uniqueness. Supplying an identity correlates a result; it does not promise
+exactly-once execution. A convenience layer may generate identities for callers
+that need none of their own, but the canonical request always has one. Session
+lifecycle requests (§2.6.3) carry the same kind of identity.
+
+`label` is a descriptive name for the transition, echoed in its block. It is not
+part of the causal contract: `id` identifies the intent and `source` its
+provenance.
 
 ```
 IntentOrigin = {
@@ -1542,8 +1785,8 @@ IntentPayload =
     | Composite           { buffer_ops: BufferOp[],
                             interaction_ops: InteractionOp[],
                             session: SessionId }
-    | Undo                { session: SessionId }
-    | Redo                { session: SessionId }
+    | Undo                {}
+    | Redo                {}
 
 IntentSource =
     | Extension { id: ExtensionId }
@@ -1560,17 +1803,27 @@ IntentClass =
 **Undo/Redo as intents (normative):** Undo and Redo are routed through the
 intent system, not as engine-internal bypasses. This satisfies the Extension
 Reflection Principle (§0.1), provides an `IntentId` for client-side speculative
-queue reconciliation (§7.2), and allows extensions to observe undo/redo
-transitions through the standard event stream. The `session` field identifies
-the interaction context that initiated the operation. In v0.1, `Undo` targets the
-most recent `UndoEntry` for the session's buffer; `Redo` targets the most recent
-redo entry. Explicit `UndoEntryId` targeting is a future extension point.
+queue reconciliation (§7.6), and allows extensions to observe undo/redo
+transitions through the standard event stream. In v0.1 history is per buffer:
+`Undo` targets the buffer's most recent `UndoEntry` and `Redo` its most recent
+redo entry, whichever session or extension made them. The payloads therefore
+carry no session: a session could not change which entry is applied, and the
+intent's `id` and `source` already attribute the operation. Per-session history
+and explicit `UndoEntryId` targeting are future extension points (§11 item 9);
+they would add the fields they need.
 
 **Undo/Redo sequencing (normative):** Undo and Redo are ordinary intents for
 scheduling purposes. They enter the same sequencing pipeline as other intents,
-are ordered by the same sequencing rules (including priority and registration
-order), validated at application time, and may be interleaved with any other
-intents targeting the same buffer.
+are ordered by the same sequencing rules (§6.1), validated at application time,
+and may be interleaved with any other intents targeting the same buffer.
+
+**Priority:** `priority` is an input to a `Queued` engine's sequencing (§6.1). A
+`Synchronous` engine applies each intent when it is submitted, so there is no
+pending set for priority to order; such an engine does not accept the field, and
+reports `sequencing: Synchronous` so a client never assumes priority was
+honoured. A host that queues intents before submitting them to a synchronous
+engine applies its own ordering, and that ordering is the sequence its blocks
+record.
 
 **Coherence rule:** If `payload` is `InteractionMutation` or `Composite`,
 `origin.interaction_revision` must be present. If `payload` is `BufferMutation`,
@@ -1615,7 +1868,7 @@ for full validation as well as the default apply policy expectations:
 
 ```
 ValidationReport = {
-    intent               : Intent
+    intent               : IntentId
     intent_class         : IntentClass
     head_revision        : Revision
     interaction_revision : InteractionRevision | None
@@ -1648,6 +1901,12 @@ StaleReason =
 `OriginUnavailable` is specific to engines with a `Rebase` policy (§6.2): the
 origin is older than the history the engine retains, so its coordinates cannot
 be interpreted at all.
+
+**Normative constraint (ownership):** a report identifies its intent; it does
+not contain or refer to the submitted intent, whose memory belongs to the
+submitter. Everything a report holds, including each evaluated guard and its
+result messages, is owned by the report and stays valid after the submitter's
+request memory is released.
 
 **Normative constraint:** `Verdict` is a projection over `per_guard`, not an
 independent computation. An engine must not produce a verdict that contradicts
@@ -1968,7 +2227,9 @@ A conforming program may not:
 
 ### 6.1 Sequencing
 
-When multiple intents target the same buffer in the same evaluation cycle:
+An engine declares its sequencing in `EngineCapabilities` (§2.1). For a `Queued`
+engine, when multiple intents target the same buffer in the same evaluation
+cycle:
 
 1. Intents are ordered by `(priority desc, registration_order asc)`.
 2. Each intent is validated against the current head revision at time of
@@ -1976,6 +2237,9 @@ When multiple intents target the same buffer in the same evaluation cycle:
 3. Application produces a new revision; subsequent intents validate against it.
 4. An intent that fails validation is rejected with a `ValidationReport`. It is
    not retried.
+
+A `Synchronous` engine applies each intent when it is submitted, in call order;
+steps 2–4 apply to it unchanged.
 
 **Guard evaluation cost.** Guard validation occurs during the engine's
 transactional application phase, not during extension evaluation. Guard
@@ -2109,53 +2373,113 @@ Extensions that require grouped composition must discover engine support via
 
 ## 7. Event Model
 
-Edits emit structured events:
+The engine *produces* one canonical record of every committed transition; how
+those records reach subscribers is *delivery*, which belongs to the host. The
+engine knows exactly what committed and in what order. How long anyone keeps
+the record, and who receives it, depends on the consumer, so the engine keeps
+no delivery state.
+
+### 7.0 Blocks (normative)
+
+```
+Block =
+    | Transition {
+        sequence     : nat
+        intent       : IntentId
+        source       : EventSource
+        label        : string | None
+        edit         : EditEvent | None
+        interactions : InteractionEvent[]   -- one per changed session (§2.6.2)
+      }
+    | Lifecycle {
+        sequence : nat
+        request  : IntentId
+        change   : SessionCreated { session, selections: SelectionValue[],
+                                    document_revision }
+                 | SessionDropped { session, interaction_revision }
+      }
+```
+
+- Every committed intent, including undo and redo, yields exactly one
+  `Transition`; every session lifecycle request yields one `Lifecycle` block.
+  A rejected intent or request yields a `ValidationReport` or error and no
+  block.
+- The block is built completely before anything is published: if any part of
+  it cannot be built, the transition has no effect (§4.1). Publication and
+  abandonment do not allocate.
+- The block is returned to the caller that committed it, who owns it. View
+  providers receive it borrowed, once the whole transition is published; they
+  may read the engine but not change it (§0.1).
+- `sequence` numbers blocks gaplessly per buffer instance, starting at zero.
+  Rejections consume no number. A buffer instance is one engine from creation
+  to destruction; a reopened or restarted buffer is a new instance whose
+  sequence restarts.
+
+### 7.1 The Edit Event
 
 ```
 EditEvent = {
-    buffer          : BufferId
-    cause           : TransactionCause
-    old_revision    : Revision
-    new_revision    : Revision
-    affected_ranges : Range[]         -- in new-revision coordinates
-    edit_class      : EditClass
-    source          : EventSource
+    old_revision     : Revision
+    new_revision     : Revision
+    edit_class       : EditClass
+    splices          : RealizedSplice[]    -- one per buffer operation, in order
+    endpoint_effects : EndpointEffect[]
 }
 
-TransactionCause =
-    | Intent  { id: IntentId }
-    | Group   { id: IntentGroupId }
-    | BuiltIn                          -- engine-internal (compaction)
+RealizedSplice = { start: Position, old_end: Position, new_end: Position }
+
+EndpointEffect = {
+    session : SessionId
+    anchor  : AnchorId
+    old     : Position | Dead    -- at old_revision
+    new     : Position | Dead    -- at new_revision
+}
 
 EditClass =
     | Insert
     | Delete
     | Replace
+    | Mixed             -- buffer operations of different kinds
     | Compaction        -- representation-only, no logical change
-
-EventSource =
-    | Extension { id: ExtensionId }
-    | UserInput
-    | Engine
 ```
 
-**Source semantics:**
+**Splice coordinates (normative):** the `i`th splice is operation `i`'s
+realized splice (§1.4). Its `start` and `old_end` are positions in the text just
+before operation `i`, which is the text after operations `0..i-1` of the same
+transition (for undo and redo, after the preceding inverse operations and their
+resurrections, §2.5.3); its `new_end` is a position in the text just after
+operation `i`. The splice rewrites `[start, old_end)` as `[start, new_end)`,
+which can extend beyond the requested target and can be non-empty with an
+unchanged grapheme count. A splice is a coordinate map only outside its closed
+region: a position `p < start` is unchanged, a position `p > old_end` becomes
+`p - old_end + new_end`, and a position in `[start, old_end]` is not described
+by the splice at all.
 
-- `Extension`: edits originating from an evaluated intent submitted by a
-  protocol-connected extension.
-- `UserInput`: edits originating from direct human interaction through the host
-  UI (e.g., typing, UI-driven commands). Per the Extension Reflection Principle
-  (§0.1), these edits must still transit the standard intent/event machinery.
-- `Engine`: intrinsic internal state transitions (e.g., compaction) that do not
-  originate from a specific user action or extension intent. Undo and redo are
-  intent-routed (§4.2), not engine-internal.
+**Endpoint effects (normative):** what happened to a session endpoint inside a
+splice's closed region depends on the requested operation, the endpoint's
+stickiness and grapheme projection (§1.4), not on the splice: in `e␤◌́`,
+deleting `[1, 2)` and replacing `[0, 3)` with `é` realize the same splice, but
+a `Weak` anchor at 1 survives the first and dies in the second. The edit event
+therefore lists explicitly:
 
-`Compaction` events have empty `affected_ranges`. They signal that internal
-layout changed but logical text did not.
+- every session endpoint that lay within the closed region `[start, old_end]`
+  of at least one splice as that splice was applied, including endpoints at a
+  splice boundary; and
+- every session endpoint the transition revived by resurrection (§2.5.3).
 
-For each `BufferOp`, `affected_ranges` reports the realized splice's new range
-`[start, new_end)` (§1.4). This can extend beyond the requested target, and can
-be non-empty with an unchanged grapheme count.
+Each listed endpoint appears once, with its value at `old_revision` and at
+`new_revision`. Every other session endpoint keeps its liveness, and a live one
+is carried through the splices in order by the shift rule above. An observer
+never infers an endpoint's death from a splice's extent. Effects are passive:
+they advance no interaction revision, and they are not interaction events.
+
+An observer that knows every session at `old_revision` therefore reconstructs
+them at `new_revision` without the text: listed endpoints take their `new`
+value, the rest shift. A block's interaction events then apply in order, each
+stating its `old` value after these passive effects (§2.6.2).
+
+`Compaction` events have no splices. They signal that internal layout changed
+but logical text did not.
 
 Two subscriber classes exist with respect to compaction:
 
@@ -2165,64 +2489,125 @@ Two subscriber classes exist with respect to compaction:
   layout caches): depend on representation-derived state. Must invalidate on
   compaction.
 
-Engines should allow subscribers to declare which class they belong to, so
-compaction events are not delivered unnecessarily.
+### 7.2 Provenance
 
-Subscribers receive events in revision order through one unified stream shared
-by `EditEvent` and `InteractionEvent`. Delivery is synchronous within a
-revision step: once the engine begins broadcasting the events caused by a
-committed step, it must deliver that step's full contiguous event block before
-broadcasting events from any later step.
+```
+TransactionCause =
+    | Intent  { id: IntentId }
+    | Group   { id: IntentGroupId }
+    | BuiltIn                          -- engine-internal (compaction)
 
-**Normative constraint (composite event ordering):** When applying a `Composite`
-intent, the engine must emit the resulting `EditEvent` followed immediately by
-the corresponding `InteractionEvent`. No intervening events from other intents,
-extensions, or intrinsic engine operations may separate them in the broadcast
-stream. This prevents speculative state tearing on the client.
+EventSource =
+    | Extension { id: ExtensionId }
+    | UserInput
+    | Engine
+```
+
+A transition block's `intent` is its cause; grouped and built-in causes are
+reserved for group modes and compaction, which the reference implementation
+does not produce.
+
+**Source semantics:**
+
+- `Extension`: transitions originating from an intent submitted by a
+  protocol-connected extension.
+- `UserInput`: transitions originating from direct human interaction through the
+  host UI (e.g., typing, UI-driven commands). Per the Extension Reflection
+  Principle (§0.1), these must still transit the standard intent machinery.
+- `Engine`: intrinsic internal transitions (e.g., compaction) that do not
+  originate from a specific user action or extension intent. Undo and redo are
+  intent-routed (§4.2), not engine-internal.
 
 **Source provenance (normative):**
 
-- `Extension`: if an applied intent has `source: Extension { id: E }`, the
-  resulting event must have `source: Extension { id: E }`.
+- `Extension`: if an applied intent has `source: Extension { id: E }`, its block
+  has `source: Extension { id: E }`.
 - `UserInput`: reserved exclusively for host-routed input that transits the
   intent machinery per §0.1. If an extension synthesizes an intent in response
-  to a user keystroke, the resulting event source is `Extension { id: ... }`,
-  not `UserInput`.
+  to a user keystroke, the source is `Extension { id: ... }`, not `UserInput`.
 - `Engine`: intrinsic transitions only (compaction).
 
-### 7.1 Acknowledgment Semantics
+### 7.3 Stream Scope (normative)
 
-Protocol events are strictly 1:1 with applied intents. The engine must not
-coalesce multiple intents into a single `EditEvent` or `InteractionEvent`. If an
-extension submits three intents, the engine validates and applies them
-sequentially, emitting three distinct events (or rejection reports), each with a
-`cause` that echoes the corresponding `IntentId`.
+The blocks of one buffer instance explain, in order:
+
+- every document revision, including undo and redo;
+- every session's existence, and its complete interaction state: selections
+  with endpoint identities, positions, liveness and roles; registers; and
+  interaction revision.
+
+They do not cover, and an observer must not assume they cover: client-created
+anchors (their creation, disposal, passive movement or resurrection; their
+creator holds the receipt and can query them); internal anchors; history
+reclamation, which changes nothing observable (§2.5.6); view-provider
+registration; persistence state; and evaluation. Document replay (deriving the
+new text from blocks), historical rebasing (§6.2, §11 item 11), event retention
+and delivery are separate capabilities or hosting responsibilities.
+
+**Snapshots (normative):** a snapshot of the stream's state carries
+`next_sequence`, the sequence number of the first block it does not reflect. An
+observer resumes with block `next_sequence`, not `next_sequence + 1`; a snapshot
+of a fresh instance has `next_sequence = 0`. A host that pairs a snapshot with
+later blocks captures both in one serialized step.
+
+**Accepted no-ops (normative):** every accepted intent commits. It advances the
+revisions its payload addresses and produces a block, even when the result is
+indistinguishable from the previous state. For a buffer mutation this means the
+document revision advances, so revision-based dirty state reports a change, an
+undo entry is recorded, and the redo branch is discarded. Identical bytes are
+not a test for a no-op: a replacement that leaves the text unchanged can still
+kill anchors. An interaction mutation that leaves the session unchanged
+advances the interaction revision and produces an interaction event with no
+changes.
+
+### 7.4 Delivery (hosting profile)
+
+Delivery is the host's: retention, fan-out, coalescing and lagging subscribers
+are hosting decisions. A delivery envelope identifies the buffer, the buffer
+instance and the block's sequence, `(buffer, instance, sequence)`. The host
+stamps the buffer and instance identities, so an engine needs no
+application-wide identifiers; a sequence number is meaningful only within its
+instance, so a restarted buffer is never mistaken for a continuation. Since
+sequences are gapless, a subscriber can detect a missing block without the
+engine retaining any.
+
+A host that broadcasts blocks delivers each one whole before any later one.
+Because a composite's edit and interaction events are parts of one block, they
+are never separated by another transition.
+
+### 7.5 Acknowledgment Semantics
+
+Blocks are strictly 1:1 with committed intents and lifecycle requests. The
+engine must not coalesce several intents into one block. If an extension
+submits three intents, the engine validates and applies them sequentially,
+producing three blocks or rejection reports, each echoing the corresponding
+`IntentId`.
 
 **Atomic group exception:** An `IntentGroup` applied with `Atomic` mode produces
-exactly one unified event with `cause: Group { id }`. The individual `IntentId`s
-within the atomic block are consumed by the group and must not generate
-individual acknowledgment or rejection events. Engines must not emit both
-group-level and member-level events for the same atomic application.
+exactly one unified block with `cause: Group { id }`. The individual
+`IntentId`s within the atomic block are consumed by the group and must not
+generate individual acknowledgments or rejections. Engines must not emit both
+group-level and member-level records for the same atomic application.
 
-**Built-in events:** Engine-internal transitions (compaction) produce events
-with `cause: BuiltIn`. These events have no associated `IntentId` and are not
-subject to the 1:1 acknowledgment rule. Undo and redo are intent-routed (§4.2)
-and produce events with `cause: Intent { id }`, not `BuiltIn`.
+**Built-in events:** Engine-internal transitions (compaction) produce blocks
+with `cause: BuiltIn`. These have no associated `IntentId` and are not subject
+to the 1:1 acknowledgment rule. Undo and redo are intent-routed (§4.2) and echo
+their intent's identity.
 
 Rejected intents produce a `ValidationReport` with a rejection verdict
 (`Invalid`, `Stale`, or `AnchorDead`) echoing the `IntentId`. Rejection reports
-are not `EditEvent`s — they are a distinct message type routed to the submitting
+are not blocks and consume no sequence number; they are routed to the submitting
 client.
 
-### 7.2 Client Reconciliation
+### 7.6 Client Reconciliation
 
 When a client maintains speculative local state (e.g., for responsive UI), the
 following reconciliation algorithm applies:
 
-**On receiving a canonical event** (`EditEvent` or `InteractionEvent`):
+**On receiving a block:**
 
-1. Apply the canonical event to the client's canonical state.
-2. Inspect the event's `cause`. If it is `Intent { id }` or `Group { id }` and
+1. Apply the block to the client's canonical state (§7.1).
+2. Inspect the block's cause. If it is `Intent { id }` or `Group { id }` and
    matches an entry in the client's local in-flight queue, pop that entry from
    the queue (it has been confirmed). If the cause is `BuiltIn`, no queue entry
    is affected.
@@ -2293,14 +2678,20 @@ Buffer advances to `r = 43`. Anchor `cursor` is now after the inserted `(`.
 Engine emits:
 
 ```
-EditEvent {
-    buffer: b
-    cause: Intent { id: <user_keystroke_id> }
-    old_revision: 42
-    new_revision: 43
-    affected_ranges: [Range { start: <pos of "(">, end: <pos after "("> }]
-    edit_class: Insert
+Transition {
+    sequence: <n>
+    intent: <user_keystroke_id>
     source: UserInput
+    edit: EditEvent {
+        old_revision: 42
+        new_revision: 43
+        edit_class: Insert
+        splices: [RealizedSplice { start: <pos of "(">, old_end: <pos of "(">,
+                                   new_end: <pos after "("> }]
+        endpoint_effects: [EndpointEffect { session: session_1, anchor: cursor,
+                                            old: <pos of "(">, new: <pos after "("> }]
+    }
+    interactions: []
 }
 ```
 
@@ -2350,10 +2741,7 @@ Result {
             ]
             interaction_ops: [
                 SetSelections { selections: [
-                    Selection {
-                        range: AnchorRange { start: cursor, end: cursor }
-                        active: End
-                    }
+                    SelectionSpec { start: Keep(cursor), end: SameAsStart }
                 ]}
             ]
             session: session_1
@@ -2436,70 +2824,66 @@ The engine applies the `Composite` payload atomically:
 1. **Buffer phase:** `Insert { target: cursor, text: ")" }`. Buffer advances to
     `r = 44`. Anchor `cursor` (`Sticky`) is rebased past the inserted `)`.
 
-2. **Interaction phase:** `SetSelections` is applied in the context of the
-   rebased anchors. The selection uses `cursor` for both start and end, forming
-   a zero-width selection (cursor position) between the parentheses. Because
-    `cursor` has `Sticky` stickiness and was rebased past `)`, the extension anticipated
-   this: the `cursor` anchor is already at the correct position *after* the
-   closing paren. To place the cursor *between* the parens, the extension should
-    have created an anchor with `Weak` stickiness at the insert point, or
-    requested an anchor via `AnchorRequest` during evaluation.
+2. **Interaction phase:** `SetSelections` is resolved against the rebased
+   anchors. `Keep(cursor)` keeps the session's caret where it is. Because
+   `cursor` is the session's `Sticky` caret and was rebased past `)`, the caret
+   is now *after* the closing paren, not between the parens.
 
-**Corrected approach:** The program requests a `between` anchor during
-evaluation:
-
-```
-anchors: [
-    AnchorReceipt { tag: "between", anchor: between_anchor, status: Live }
-]
-```
-
-The `Composite` interaction ops then use `between_anchor` for the selection:
+**Corrected approach:** The extension places the caret at the start of the
+inserted text with an edit reference, keeping the caret's identity:
 
 ```
 SetSelections { selections: [
-    Selection {
-        range: AnchorRange { start: between_anchor, end: between_anchor }
-        active: End
+    SelectionSpec {
+        start: Move(cursor, Edit(EditRef { op: 0, edge: Start }))
+        end: SameAsStart
     }
 ]}
 ```
 
-This places the cursor between `(` and `)` as intended. The `between_anchor`
-(with `Weak` stickiness) stays before the inserted `)`.
+This places the caret between `(` and `)` as intended, with no client-computed
+coordinate. (Sampling a `Weak` anchor that the program requested during
+evaluation, with `Move(cursor, AnchorPosition(between_anchor))`, works too, but
+only the session's own endpoint becomes the caret.)
 
 **Phase 5: Events**
 
-Engine emits both events atomically (per §7 composite event ordering):
+The engine publishes one block for the composite (§7), which the host delivers
+whole:
 
 ```
-EditEvent {
-    buffer: b
-    cause: Intent { id: <auto_close_intent_id> }
-    old_revision: 43
-    new_revision: 44
-    affected_ranges: [Range { start: <pos of ")">, end: <pos after ")"> }]
-    edit_class: Insert
+Transition {
+    sequence: <n + 1>
+    intent: <auto_close_intent_id>
     source: Extension { id: "auto_close_ext" }
-}
-
-InteractionEvent {
-    session: session_1
-    buffer: b
-    cause: Intent { id: <auto_close_intent_id> }
-    old_revision: 7
-    new_revision: 8
-    changed: [SelectionsChanged { 
-        old: <previous>, 
-        new: <cursor between parens> 
+    edit: EditEvent {
+        old_revision: 43
+        new_revision: 44
+        edit_class: Insert
+        splices: [RealizedSplice { start: <pos of ")">, old_end: <pos of ")">,
+                                   new_end: <pos after ")"> }]
+        endpoint_effects: [EndpointEffect { session: session_1, anchor: cursor,
+                                            old: <pos of ")">, new: <pos after ")"> }]
+    }
+    interactions: [InteractionEvent {
+        session: session_1
+        document_revision: 44
+        old_revision: 7
+        new_revision: 8
+        selections: SelectionsChanged {
+            old: [<caret after ")">],
+            new: [<the same caret, between the parens>]
+        }
+        registers: []
     }]
-    source: Extension { id: "auto_close_ext" }
 }
 ```
 
 Other subscribers (syntax highlighter, bracket matcher, structural editing
-extensions) update incrementally. A structural editing extension could intercept
-the `InteractionEvent` and snap the cursor to an AST node boundary if desired.
+extensions) update incrementally. A structural editing extension that wants to
+snap the caret to an AST node boundary submits its own intent; with a
+host-mediated pipeline (§0.1) it could instead intercept the auto-close intent
+before it reaches the engine.
 
 ---
 
@@ -2828,11 +3212,14 @@ Items deferred from this draft, required before stabilization:
    custom composition rules remain core-only. Operator set may evolve; registry
    contents may be refined.
 6. ~~**Cursor/selection model**~~: resolved. Selections are protocol-visible via
-   `Session` and `InteractionState` (§2.6). Selections are `AnchorRange` with an
-   `active` edge. Interaction mutations are part of the `IntentPayload`
-   (including `Composite` for atomic buffer+interaction changes). Interaction
-   events are sequenced alongside edit events. Registers provide session-local
-   ephemeral storage for extension state. The engine remains GUI-agnostic.
+   `Session` and `InteractionState` (§2.6): endpoint slots with an `active`
+   edge, over anchors the session owns. `SetSelections` states for each
+   endpoint whether it is kept, moved or new (§2.6.1), so a replacement
+   preserves the identities the causal model relies on, including dead marks.
+   Interaction mutations are part of the `IntentPayload` (including `Composite`
+   for atomic buffer+interaction changes), and sessions are created and dropped
+   by intrinsic requests (§2.6.3). Registers provide session-local ephemeral
+   storage for extension state. The engine remains GUI-agnostic.
 7. ~~**Content guard hash specification**~~: resolved. `SliceHash` uses XXH64
    with seed 0, 8-byte little-endian digest. Streaming execution required (no
    intermediate allocation). Representation-invariant. Guard evaluation cost
@@ -2851,7 +3238,7 @@ Items deferred from this draft, required before stabilization:
 10. **Concurrency model**: partially resolved in single-authority environments.
     The protocol defines a complete single-authority concurrency model with
     deterministic client-side speculation, `TransactionCause`-based
-    acknowledgment, and queue reconciliation (§7.1, §7.2). Distributed merge
+    acknowledgment, and queue reconciliation (§7.5, §7.6). Distributed merge
     semantics (e.g., peer-to-peer CRDTs or multi-user operational
     transformation) remain deferred as an external coordination layer.
 11. **Coordinate rebasing across revisions**: partially resolved. This is
@@ -2866,65 +3253,25 @@ Items deferred from this draft, required before stabilization:
     are not additive (§1.3), so an engine rebasing a position needs the
     realized splice of every retained revision and enough text to project
     positions that fall inside rewritten context (§1.4). A client that rebases
-    its own speculative queue (§7.2) needs the same information, and must also
-    segment with the engine's profile. `affected_ranges` supports neither.
+    its own speculative queue (§7.6) needs the same information, and must also
+    segment with the engine's profile. Realized splices (§7.1) describe each
+    revision's rewritten regions but not positions inside them, so they support
+    neither on their own.
     Candidate mechanisms are retained splice history with an origin-to-head
-    projection query, realized splices in event blocks (item 12), and a
+    projection query, the realized splices that blocks now carry (§7.1), and a
     segmentation-profile capability (for example `"UAX29-extended/16.0.0"`).
     Changing the profile of an existing buffer is a coordinate migration, not
     an edit, and is unspecified.
-12. **Canonical event production**: open; direction agreed. §7 currently
-    describes two things at once: what an engine reports about a committed
-    transition, and how those reports reach subscribers. They have different
-    owners. Only the engine knows exactly what committed, in what order, and
-    how interaction state changed. How long anyone keeps that record, and who
-    receives it, depends on the consumer: a host may keep the last thousand
-    blocks, forward each one immediately, or record them indefinitely for
-    reproducibility. The engine should not need to know which. The intended
-    split:
+12. **Canonical event production**: resolved in §7. The engine produces one
+    owned block per committed intent or session lifecycle request, built before
+    publication and returned at commit, with a gapless per-instance sequence;
+    delivery, retention and the envelope's buffer and instance identities
+    belong to the host (§7.4). Blocks carry realized splices and explicit
+    session endpoint effects, which make session state reconstructible without
+    text or segmentation (§7.1), and identify intents by a mandatory opaque
+    `IntentId` (§4.2). Interception is host-mediated (§0.1).
 
-    - *Production* belongs to the engine. Every committed transition yields
-      one owned canonical event block, returned from the call that commits
-      it. The engine numbers blocks from a gapless per-buffer sequence;
-      rejected intents consume no number. Since the sequence has no gaps, a
-      consumer can verify that it has seen every block without the engine
-      retaining any of them. Once a block is returned, the engine keeps no
-      delivery state.
-    - *Delivery* belongs to the host: retention, fan-out, coalescing and
-      lagging subscribers are hosting profiles. A host that pairs a snapshot
-      at sequence `N` with blocks `N+1` onward must capture both in one
-      serialized step; otherwise a block can commit between the snapshot and
-      the start of observation.
-
-    Decisions recorded with that split:
-
-    - Every protocol-visible state mutation enters through one authoritative
-      submission path. Direct mutators that bypass it, such as applying
-      buffer operations or changing session cursors and marks outside
-      `submit`, are the privileged pathways §0.1 rules out. They are routed
-      through submission rather than taught to produce events individually.
-    - A transaction is not published as committed until its event block is
-      complete and every failure-prone preparation has succeeded. A failure
-      during preparation restores the previous state. This is the payload
-      atomicity of §4.1 extended to event construction, and it depends on the
-      same allocation-failure work.
-    - Causal observability and replay are separate capabilities. A causal
-      block carries the sequence number, revisions, intent identity and
-      provenance, realized splices and explicit interaction changes. That
-      supports audit and invalidation, and its size does not grow with the
-      inserted text. A replay-capable block additionally carries enough
-      content to reconstruct the next document state. Whether that content is
-      copied or referenced in the engine's append-only stores is open: a
-      reference avoids duplicating a 50 MB insertion, but ties the event's
-      lifetime to the store's.
-    - A block contains an interaction event only for an explicit interaction
-      mutation (§2.6). Its old and new values are stated against the document
-      revision they address, not only the interaction revision. Passive
-      cursor movement caused by another transaction is explained by that
-      transaction's document event and is never reported as an interaction
-      event. A consumer that tracks another session's positions therefore
-      needs replay-capable content or an engine query.
-
-    Still open: the block's concrete shape, intent identity (`IntentId`,
-    §4.2), the representation of replay content, and how view providers
-    receive blocks.
+    Still open: replay-capable blocks, which carry enough content to
+    reconstruct the next document state, and whether that content is copied
+    or referenced in the engine's append-only stores. Causal blocks do not grow
+    with inserted text; a replay block would.

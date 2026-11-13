@@ -52,13 +52,17 @@ test "buffer eval rejects mismatched revision and interaction coherence" {
 
     var engine = try BufferEngine.initFromText(std.testing.allocator, "alpha", null);
     defer engine.deinit();
-    const cursor = try engine.createAnchor(0, .sticky);
-    const session_id = try engine.createSession(&[_]anchors.AnchorId{cursor});
+    const session_id, _ = try @import("support.zig").caret(&engine, 0);
 
-    var revision_outcome = try engine.bufferEval(.{ .revision = 1, .fuel = 1, .program = .{ .run = Program.run } });
+    var revision_outcome = try engine.bufferEval(
+        .{ .revision = 1, .fuel = 1, .program = .{ .run = Program.run } },
+    );
     defer revision_outcome.deinit(std.testing.allocator);
     switch (revision_outcome) {
-        .err => |eval_error| try std.testing.expectEqualStrings("revision 1 is unavailable; current revision is 0", eval_error.reason),
+        .err => |eval_error| try std.testing.expectEqualStrings(
+            "revision 1 is unavailable; current revision is 0",
+            eval_error.reason,
+        ),
         else => return error.TestUnexpectedResult,
     }
 
@@ -70,7 +74,10 @@ test "buffer eval rejects mismatched revision and interaction coherence" {
     });
     defer coherence_outcome.deinit(std.testing.allocator);
     switch (coherence_outcome) {
-        .err => |eval_error| try std.testing.expectEqualStrings("interaction_revision requires session_id", eval_error.reason),
+        .err => |eval_error| try std.testing.expectEqualStrings(
+            "interaction_revision requires session_id",
+            eval_error.reason,
+        ),
         else => return error.TestUnexpectedResult,
     }
 
@@ -83,7 +90,10 @@ test "buffer eval rejects mismatched revision and interaction coherence" {
     });
     defer session_outcome.deinit(std.testing.allocator);
     switch (session_outcome) {
-        .err => |eval_error| try std.testing.expectEqualStrings("interaction revision 1 is unavailable; current revision is 0", eval_error.reason),
+        .err => |eval_error| try std.testing.expectEqualStrings(
+            "interaction revision 1 is unavailable; current revision is 0",
+            eval_error.reason,
+        ),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -100,7 +110,9 @@ test "buffer eval returns incomplete when fuel is exhausted" {
     var engine = try BufferEngine.initFromText(std.testing.allocator, "alpha beta", null);
     defer engine.deinit();
 
-    var outcome = try engine.bufferEval(.{ .revision = 0, .fuel = 1, .program = .{ .run = Program.run } });
+    var outcome = try engine.bufferEval(
+        .{ .revision = 0, .fuel = 1, .program = .{ .run = Program.run } },
+    );
     defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .incomplete => |incomplete| {
@@ -123,6 +135,7 @@ test "buffer eval callable can return intent for later submission" {
             const pos = try view.graphemeCount();
             ctx.ops[0] = .{ .insert = .{ .pos = pos, .text = "!" } };
             ctx.intent = .{
+                .id = .{ .value = 7 },
                 .payload = .{ .buffer_mutation = .{ .ops = ctx.ops[0..] } },
                 .origin = 0,
             };
@@ -177,7 +190,10 @@ test "buffer eval enforces engine limits" {
     });
     defer lookahead_outcome.deinit(std.testing.allocator);
     switch (lookahead_outcome) {
-        .err => |eval_error| try std.testing.expectEqualStrings("lookahead 5000 exceeds max_lookahead 4096", eval_error.reason),
+        .err => |eval_error| try std.testing.expectEqualStrings(
+            "lookahead 5000 exceeds max_lookahead 4096",
+            eval_error.reason,
+        ),
         else => return error.TestUnexpectedResult,
     }
 
@@ -188,7 +204,10 @@ test "buffer eval enforces engine limits" {
     });
     defer fuel_outcome.deinit(std.testing.allocator);
     switch (fuel_outcome) {
-        .err => |eval_error| try std.testing.expectEqualStrings("fuel 20000 exceeds max_fuel 10000", eval_error.reason),
+        .err => |eval_error| try std.testing.expectEqualStrings(
+            "fuel 20000 exceeds max_fuel 10000",
+            eval_error.reason,
+        ),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -210,8 +229,37 @@ test "query capabilities reports current surface truthfully" {
     try std.testing.expectEqualStrings("Strict", capabilities.apply_policies[0]);
     try std.testing.expectEqual(@as(usize, 1), capabilities.program_carriers.len);
     try std.testing.expectEqualStrings("zig-callback", capabilities.program_carriers[0].kind);
-    try std.testing.expectEqualStrings("PrototypeOperationCount", capabilities.program_carriers[0].fuel_model);
+    try std.testing.expectEqualStrings(
+        "PrototypeOperationCount",
+        capabilities.program_carriers[0].fuel_model,
+    );
     try std.testing.expectEqual(@as(u32, 4096), capabilities.limits.max_guard_extent);
     try std.testing.expectEqual(@as(u32, 4096), capabilities.limits.max_lookahead);
     try std.testing.expectEqual(@as(u32, 10_000), capabilities.limits.max_fuel);
+}
+
+test "buffer eval search beyond the evaluated range returns null without leaking" {
+    const Program = struct {
+        fn run(_: ?*anyopaque, view_ptr: *anyopaque) anyerror!EvalValue {
+            const view = castEvalView(view_ptr);
+            // "beta" exists in the document, but outside [0, 5).
+            if (try view.findNext("beta", 0)) |match| return .{ .search_match = match };
+            return .{ .none = {} };
+        }
+    };
+
+    var engine = try BufferEngine.initFromText(std.testing.allocator, "alpha beta", null);
+    defer engine.deinit();
+    var outcome = try engine.bufferEval(.{
+        .revision = 0,
+        .start = 0,
+        .end = 5,
+        .fuel = 4,
+        .program = .{ .run = Program.run },
+    });
+    defer outcome.deinit(std.testing.allocator);
+    switch (outcome) {
+        .result => |result| try std.testing.expect(result.value == .none),
+        else => return error.TestUnexpectedResult,
+    }
 }

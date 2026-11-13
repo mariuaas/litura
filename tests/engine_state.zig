@@ -12,17 +12,21 @@ const AnchorState = struct {
     position: u32,
     stickiness: litura.anchors.AnchorStickiness,
     status: litura.anchors.AnchorStatus,
+    kind: litura.anchors.AnchorKind,
+    refs: u32,
+    touched: bool,
 };
 
-const CursorState = struct {
-    anchor: u32,
-    mark: ?u32,
+const RegisterState = struct {
+    key: []const u8,
+    value: litura.events.InteractionValue,
 };
 
 const SessionState = struct {
     id: u32,
     revision: u32,
-    cursors: []const CursorState,
+    selections: []const litura.engine.Selection,
+    registers: []const RegisterState,
 };
 
 const EntryState = struct {
@@ -36,6 +40,10 @@ pub const State = struct {
     arena: std.heap.ArenaAllocator,
     text: []const u8,
     revision: u32,
+    /// Identity boundaries and the sequence: a failure must issue and consume nothing.
+    next_public_anchor_id: u32,
+    next_session_id: u32,
+    next_sequence: u64,
     add_buffer_bytes: usize,
     anchors: []const AnchorState,
     sessions: []const SessionState,
@@ -63,6 +71,9 @@ pub const State = struct {
             .position = anchor.position,
             .stickiness = anchor.stickiness,
             .status = anchor.status,
+            .kind = anchor.kind,
+            .refs = anchor.refs,
+            .touched = anchor.touched,
         });
         std.mem.sort(AnchorState, anchor_list.items, {}, struct {
             fn lessThan(_: void, a: AnchorState, b: AnchorState) bool {
@@ -73,15 +84,18 @@ pub const State = struct {
         var session_list: std.ArrayListUnmanaged(SessionState) = .empty;
         var session_iter = engine.sessions.valueIterator();
         while (session_iter.next()) |session| {
-            const cursors = try allocator.alloc(CursorState, session.interaction.cursors.items.len);
-            for (session.interaction.cursors.items, cursors) |cursor, *copy| copy.* = .{
-                .anchor = cursor.anchor.value,
-                .mark = if (cursor.mark) |mark| mark.value else null,
-            };
+            const registers = try allocator.alloc(RegisterState, session.registers.count());
+            for (session.registers.keys(), session.registers.values(), registers) |key, value, *copy| {
+                copy.* = .{
+                    .key = try allocator.dupe(u8, key),
+                    .value = try value.dupe(allocator),
+                };
+            }
             try session_list.append(allocator, .{
                 .id = session.id,
-                .revision = session.interaction.revision,
-                .cursors = cursors,
+                .revision = session.revision,
+                .selections = try allocator.dupe(litura.engine.Selection, session.selections),
+                .registers = registers,
             });
         }
         std.mem.sort(SessionState, session_list.items, {}, struct {
@@ -97,6 +111,9 @@ pub const State = struct {
             .arena = arena,
             .text = text.items,
             .revision = engine.revision,
+            .next_public_anchor_id = engine.next_public_anchor_id,
+            .next_session_id = engine.next_session_id,
+            .next_sequence = engine.next_sequence,
             .add_buffer_bytes = engine.table.add_buf.items.len,
             .anchors = anchor_list.items,
             .sessions = session_list.items,
@@ -114,6 +131,9 @@ pub const State = struct {
     pub fn expectEqual(expected: *const State, actual: *const State) !void {
         try std.testing.expectEqualStrings(expected.text, actual.text);
         try std.testing.expectEqual(expected.revision, actual.revision);
+        try std.testing.expectEqual(expected.next_public_anchor_id, actual.next_public_anchor_id);
+        try std.testing.expectEqual(expected.next_session_id, actual.next_session_id);
+        try std.testing.expectEqual(expected.next_sequence, actual.next_sequence);
         try std.testing.expectEqual(expected.add_buffer_bytes, actual.add_buffer_bytes);
         try std.testing.expectEqualDeep(expected.anchors, actual.anchors);
         try std.testing.expectEqualDeep(expected.sessions, actual.sessions);
@@ -157,6 +177,7 @@ fn copyHistory(allocator: std.mem.Allocator, entries: []const types.UndoEntry) !
         };
         const metas = try allocator.alloc(types.DeletionMeta, entry.deletion_metas.len);
         for (entry.deletion_metas, metas) |meta, *meta_copy| meta_copy.* = .{
+            .op = meta.op,
             .target_anchor = meta.target_anchor,
             .inverse_text = try allocator.dupe(u8, meta.inverse_text),
             .dead_anchors = try allocator.dupe(types.DeadAnchorRecord, meta.dead_anchors),
