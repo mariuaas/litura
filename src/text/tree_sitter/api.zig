@@ -15,6 +15,35 @@ pub const Point = struct {
     fn fromRaw(raw: c.TSPoint) Point {
         return .{ .row = raw.row, .column = raw.column };
     }
+
+    fn toRaw(self: Point) c.TSPoint {
+        return .{ .row = self.row, .column = self.column };
+    }
+};
+
+/// One change to the text, in byte offsets and points of the text at that moment.
+pub const InputEdit = struct {
+    start_byte: u32,
+    old_end_byte: u32,
+    new_end_byte: u32,
+    start_point: Point,
+    old_end_point: Point,
+    new_end_point: Point,
+};
+
+/// UTF-8 text read in chunks: `read` returns the contiguous bytes stored at `byte`, or
+/// an empty slice at the end. The returned memory must stay valid until the parse call
+/// returns.
+pub const Input = struct {
+    context: *const anyopaque,
+    read: *const fn (context: *const anyopaque, byte: u32) []const u8,
+};
+
+/// Asked periodically during a parse; returning true halts it so that the next call with
+/// the same old tree and input resumes where it stopped.
+pub const Progress = struct {
+    context: *anyopaque,
+    halt: *const fn (context: *anyopaque) bool,
 };
 
 pub const QueryPredicateStep = struct {
@@ -83,6 +112,22 @@ pub const Node = struct {
         return c.ts_node_named_child_count(self.raw);
     }
 
+    /// Whether the node contains a syntax error or a missing node.
+    pub fn hasError(self: Node) bool {
+        return c.ts_node_has_error(self.raw);
+    }
+
+    pub fn descendantCount(self: Node) u32 {
+        return c.ts_node_descendant_count(self.raw);
+    }
+
+    /// The node as an S-expression, allocated with `allocator`.
+    pub fn toSexp(self: Node, allocator: std.mem.Allocator) ![]u8 {
+        const raw = c.ts_node_string(self.raw) orelse return error.OutOfMemory;
+        defer std.c.free(raw);
+        return allocator.dupe(u8, std.mem.span(raw));
+    }
+
     pub fn descendantForByteRange(self: Node, start_byte: u32, end_byte: u32) Node {
         return .{ .raw = c.ts_node_descendant_for_byte_range(self.raw, start_byte, end_byte) };
     }
@@ -107,6 +152,63 @@ pub const Tree = struct {
     pub fn rootNode(self: Tree) Node {
         return .{ .raw = c.ts_tree_root_node(self.raw) };
     }
+
+    /// Records a change so that a later parse can reuse the unchanged parts.
+    pub fn edit(self: Tree, change: InputEdit) void {
+        const raw = c.TSInputEdit{
+            .start_byte = change.start_byte,
+            .old_end_byte = change.old_end_byte,
+            .new_end_byte = change.new_end_byte,
+            .start_point = change.start_point.toRaw(),
+            .old_end_point = change.old_end_point.toRaw(),
+            .new_end_point = change.new_end_point.toRaw(),
+        };
+        c.ts_tree_edit(self.raw, &raw);
+    }
+};
+
+/// Walks a tree by visible nodes. Owns memory from Tree-sitter's allocator.
+pub const TreeCursor = struct {
+    raw: c.TSTreeCursor,
+
+    pub fn init(start: Node) TreeCursor {
+        return .{ .raw = c.ts_tree_cursor_new(start.raw) };
+    }
+
+    pub fn deinit(self: *TreeCursor) void {
+        c.ts_tree_cursor_delete(&self.raw);
+        self.* = undefined;
+    }
+
+    pub fn node(self: *const TreeCursor) Node {
+        return .{ .raw = c.ts_tree_cursor_current_node(&self.raw) };
+    }
+
+    /// The current node's index in a preorder walk from the cursor's root.
+    pub fn descendantIndex(self: *const TreeCursor) u32 {
+        return c.ts_tree_cursor_current_descendant_index(&self.raw);
+    }
+
+    pub fn gotoDescendant(self: *TreeCursor, index: u32) void {
+        c.ts_tree_cursor_goto_descendant(&self.raw, index);
+    }
+
+    /// Moves to the first child that ends after `byte`; false if there is none.
+    pub fn gotoFirstChildForByte(self: *TreeCursor, byte: u32) bool {
+        return c.ts_tree_cursor_goto_first_child_for_byte(&self.raw, byte) >= 0;
+    }
+
+    pub fn gotoFirstChild(self: *TreeCursor) bool {
+        return c.ts_tree_cursor_goto_first_child(&self.raw);
+    }
+
+    pub fn gotoNextSibling(self: *TreeCursor) bool {
+        return c.ts_tree_cursor_goto_next_sibling(&self.raw);
+    }
+
+    pub fn gotoParent(self: *TreeCursor) bool {
+        return c.ts_tree_cursor_goto_parent(&self.raw);
+    }
 };
 
 pub const Parser = struct {
@@ -126,6 +228,57 @@ pub const Parser = struct {
         if (!c.ts_parser_set_language(self.raw, language)) {
             return error.IncompatibleLanguage;
         }
+    }
+
+    /// Parses `input`, reusing `old_tree` if it has been edited to match. Returns null
+    /// when `progress` halted the parse; the next call with the same old tree and input
+    /// resumes it, unless `reset` is called first.
+    pub fn parseInput(
+        self: *Parser,
+        old_tree: ?Tree,
+        input: Input,
+        progress: ?Progress,
+    ) error{ParseFailed}!?Tree {
+        const Adapter = struct {
+            fn read(
+                payload: ?*anyopaque,
+                byte: u32,
+                _: c.TSPoint,
+                bytes_read: [*c]u32,
+            ) callconv(.c) [*c]const u8 {
+                const typed: *const Input = @ptrCast(@alignCast(payload.?));
+                const chunk = typed.read(typed.context, byte);
+                bytes_read.* = @intCast(chunk.len);
+                return chunk.ptr;
+            }
+
+            fn progressCallback(state: [*c]c.TSParseState) callconv(.c) bool {
+                const typed: *const Progress = @ptrCast(@alignCast(state.*.payload.?));
+                return typed.halt(typed.context);
+            }
+        };
+        var progress_copy = progress;
+        const raw_input = c.TSInput{
+            .payload = @ptrCast(@constCast(&input)),
+            .read = Adapter.read,
+            .encoding = c.TSInputEncodingUTF8,
+            .decode = null,
+        };
+        const options = c.TSParseOptions{
+            .payload = if (progress_copy) |*p| @ptrCast(p) else null,
+            .progress_callback = if (progress_copy != null) Adapter.progressCallback else null,
+        };
+        const old_raw = if (old_tree) |tree| tree.raw else null;
+        const raw = c.ts_parser_parse_with_options(self.raw, old_raw, raw_input, options) orelse {
+            if (progress_copy != null) return null;
+            return error.ParseFailed;
+        };
+        return .{ .raw = raw };
+    }
+
+    /// Drops a halted parse, so the next parse starts from the beginning.
+    pub fn reset(self: *Parser) void {
+        c.ts_parser_reset(self.raw);
     }
 
     pub fn parseString(self: *Parser, source: []const u8, old_tree: ?Tree) !Tree {
@@ -232,18 +385,5 @@ pub const QueryCursor = struct {
     }
 };
 
-pub fn luaLanguage() *const c.TSLanguage {
-    return tree_sitter_lua();
-}
-
-pub fn zigLanguage() *const c.TSLanguage {
-    return tree_sitter_zig();
-}
-
-pub fn fennelLanguage() *const c.TSLanguage {
-    return tree_sitter_fennel();
-}
-
-extern fn tree_sitter_lua() callconv(.c) *const c.TSLanguage;
-extern fn tree_sitter_zig() callconv(.c) *const c.TSLanguage;
-extern fn tree_sitter_fennel() callconv(.c) *const c.TSLanguage;
+pub extern fn tree_sitter_lua() callconv(.c) *const c.TSLanguage;
+pub extern fn tree_sitter_zig() callconv(.c) *const c.TSLanguage;

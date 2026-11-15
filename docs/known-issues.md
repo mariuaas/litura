@@ -1,28 +1,36 @@
 # Known correctness and contract gaps
 
-The v0.1 specification is authoritative but remains a draft. These implementation gaps are retained explicitly; structural cleanup must not silently turn them into different runtime behavior. A correction needs its own contract decision and regression tests. This is not a complete correctness audit.
-
-## Allocation failure and transactions
-
-Buffer operations are applied provisionally and committed only after the whole payload, and for composites its interaction mutations, validate against the realized text. The piece table runs each payload as a transaction: committed tree nodes are copied on first write and never written, so rollback discards the candidate tree and restores the anchor snapshot without allocating, even under persistent allocator exhaustion. Interaction mutations and session creation are prepared in an overlay with provisional identities. Everything that can fail (the history slot, anchor and session capacity, undo's resurrection, the owned block) happens before publication, and publication, abandonment and provider notification do not allocate. Injection tests in `tests/allocation_failure_test.zig` and `tests/transaction_test.zig` cover transient and persistent failures, including node splits, merges, undo/redo, interaction-only and composite transitions with new endpoints, and session creation; the state comparator includes the identity boundaries and the sequence. `PieceTable.initFromText` builds a replacement tree before releasing the current one. The design is recorded in [the atomicity study](development/piece-tree-atomicity-study.md).
+The v0.1 specification is a draft. This is not a complete audit. Transaction atomicity, including under allocator exhaustion, is implemented as described in [the piece-tree study](development/piece-tree-atomicity-study.md). What follows is still true of the library.
 
 ## Differences from the specification
 
-Every intent and session creation states its document origin, and every interaction mutation its interaction origin; the types have no default, so no request obtains head-relative semantics by omission. Litura carries the interaction origin on each interaction mutation rather than once per intent, which allows a composite to change several sessions; for one session the two are equivalent.
-
-The points where SPEC §4.2 and Litura once differed are settled in the specification: undo and redo carry no session in v0.1, `priority` applies only to engines that report `Queued` sequencing (Litura reports `Synchronous`), and intrinsic requests fail with typed errors (`BufferEngine.RequestError`), not validation reports (§2.6.3).
+Litura carries the interaction origin on each interaction mutation rather than once per intent, so a composite can change several sessions; for one session the two are equivalent.
 
 zg 0.16.2's `Graphemes.Iterator` sums cluster length in a `u8`, so a grapheme longer than 255 bytes panics in safe builds and is mismeasured otherwise. `text_segmentation.Iterator` drives zg's `graphemeBreak` with a full-width length instead; remove it once upstream is fixed.
 
 ## Costs
 
-Each buffer operation rebases every anchor in the document, and each buffer transaction snapshots the anchor map for rollback, so a transition costs time proportional to its operations times the anchors held. Composites that use edit references add two transaction-scoped anchors per buffer operation. `set_selections` checks endpoint ownership with a linear scan per endpoint, which is quadratic in a session's selection count. `zig build measure` reports these costs; with a thousand carets, typing one character at each takes milliseconds per submission.
+Each buffer operation rebases every anchor, and each buffer transaction snapshots the anchor map, so a transition costs time proportional to its operations times the anchors held. Composites that use edit references add two transaction-scoped anchors per buffer operation. `set_selections` checks endpoint ownership with a linear scan per endpoint, which is quadratic in a session's selection count. `zig build measure` reports these costs; with a thousand carets, typing one character at each takes milliseconds per submission.
 
-Public dead anchors whose resurrection path was discarded stay in storage until their owner disposes of them, by design (SPEC §2.5.6). A client or session that never releases them keeps them.
+Public dead anchors whose resurrection path was discarded stay in storage until their owner disposes of them, by design (SPEC §2.5.6).
+
+## Syntax views
+
+Incremental parse agrees with a fresh parse of the same text whenever that text has no syntax errors, with one exception owned upstream: Tree-sitter's own incremental parse can differ after several edits. The grammar-diversity suite found this only with tree-sitter-ocaml's quoted strings and quoted extensions (`{id|…|id}`, `{%ext|…|}`). Inside syntax errors, recovery depends on which old nodes Tree-sitter reuses and, for a parse halted by its budget, on where it resumed; the views stay consistent with the provider's own tree. Rationale, measurements and the rejected Tree-sitter patch are in [the design note](development/incremental-syntax.md).
+
+A reparse costs time proportional to the number of items in each long list it passes. `zig build measure-syntax -Dtree-sitter=true` shows about 15 µs of refresh work per KiB per keystroke on generated Lua, 125 ms at 8 MiB. Submission stays near 20 µs. Edits that change how the rest of the document parses, such as opening a block comment near the top, reparse everything after them.
+
+A refresh can overrun its budget. Tree-sitter asks whether to stop only between tokens and every hundred or so operations. While typing, the longest single call measured 5.5 ms at 1 MiB and 26 ms at 8 MiB with a 4 ms budget; opening an unterminated Lua block comment at the top of 8 MiB took 254 ms in one call.
+
+A halted parse copies the document so it can finish while edits continue. The view becomes current only when a parse finishes before the next edit. If the copy cannot be allocated, the next edit abandons the halted parse, and an abandoned first parse starts over.
+
+Highlight predicates are evaluated only partly: `#eq?`, `#any-of?` and a few `#match?` patterns. Any other predicate is treated as satisfied.
+
+Tree-sitter allocates with its own allocator, which aborts on exhaustion rather than reporting it. Those allocations are outside Litura's allocation-failure contract.
 
 ## Borrowed results and evaluation
 
-Provider callbacks use opaque engine and block pointers. Array ownership is defined for token, diagnostic and semantic-token queries, but nested strings and syntax/type/hover/symbol lifetimes depend on the provider. Tree-sitter syntax paths expire at refresh/destruction. Evaluation values do not own intent backing storage. `queryRegister` returns a value borrowed until the session next changes.
+Provider callbacks use opaque engine and block pointers. Array ownership is defined for token, diagnostic and semantic-token queries, but nested strings and syntax/type/hover/symbol lifetimes depend on the provider. Evaluation values do not own intent backing storage. `queryRegister` returns a value borrowed until the session next changes.
 
 The native evaluation carrier meters view operations, not arbitrary callback execution. It is not a sandbox or a CPU-time bound.
 

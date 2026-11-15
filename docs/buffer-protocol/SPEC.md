@@ -693,7 +693,7 @@ model:
 
 | ViewClass | Transport | Adapter Pattern |
 |---|---|---|
-| Tokens | PushBacked | Host pushes `TokenSpan[]` with revision tag |
+| Tokens | PushBacked or CallbackBacked | Host pushes `TokenSpan[]` with revision tag, or engine routes range queries to registered provider |
 | Syntax | CallbackBacked | Engine routes node queries to registered provider |
 | Diagnostics | PushBacked | Host pushes `Diagnostic[]` with revision tag |
 | SemanticTokens | PushBacked | Host pushes `SemanticToken[]` with revision tag |
@@ -713,6 +713,22 @@ revision. The provider signals readiness at a revision without pushing data;
 the engine updates `ViewState` accordingly. If the buffer advances past the
 provider's declared revision, the view becomes `Stale`. The provider catches
 up by signaling readiness at the new revision.
+
+**Refresh (normative for callback-backed views).** The work a provider does to
+catch up happens only when the host asks for it with a refresh. A refresh may
+carry a budget, a host-supplied test of whether to stop; the engine owns no
+clock. A provider that exhausts the budget keeps its progress, leaves the view
+`Stale` with the revision it last completed, and resumes on a later refresh.
+Progress made toward an older revision may still be completed after the buffer
+advances, so that edits arriving faster than the work can finish do not keep
+the view from catching up.
+
+**Queries never refresh (normative).** A query against a registered view that
+is not `Available` or `Partial` at the requested revision fails, reporting the
+view as stale or unavailable. It neither performs the refresh nor answers from
+an older revision. A query that succeeds and finds nothing (no tokens in a
+range, no node at a position) is distinct from one that fails: provider errors,
+including resource exhaustion, are reported as errors, never as absence.
 
 Transport differs; causal semantics do not. All view queries across both
 transport classes are revision-parametric and subject to the same snapshot
@@ -788,6 +804,15 @@ revision that produced it and must not be treated like a durable anchor. If a
 client presents a `SyntaxNodeRef` at a later buffer revision, the engine must
 reject it as stale. Durable identity across edits remains anchor- and
 guard-based.
+
+A reference is a plain value. Issuing, copying and discarding references
+requires no storage in the engine or the provider, so a client may keep as
+many as it likes for as long as their revision is current.
+
+`query_enclosing_syntax_node` returns the smallest node whose range contains
+the grapheme at the position, preferring named nodes, or `None` when no node
+contains it (for example, whitespace before the first token). A provider error
+is an error, not `None`.
 
 Syntax node kinds are normalized strings. Engines may choose the granularity
 supported by their provider, but must not expose provider-native node handles as
@@ -2426,7 +2451,19 @@ EditEvent = {
     endpoint_effects : EndpointEffect[]
 }
 
-RealizedSplice = { start: Position, old_end: Position, new_end: Position }
+RealizedSplice = {
+    start         : Position
+    old_end       : Position
+    new_end       : Position
+    start_byte    : u32      -- UTF-8 byte offsets of the same three boundaries
+    old_end_byte  : u32
+    new_end_byte  : u32
+    start_point   : Point
+    old_end_point : Point
+    new_end_point : Point
+}
+
+Point = { row: u32, column: u32 }
 
 EndpointEffect = {
     session : SessionId
@@ -2454,6 +2491,17 @@ unchanged grapheme count. A splice is a coordinate map only outside its closed
 region: a position `p < start` is unchanged, a position `p > old_end` becomes
 `p - old_end + new_end`, and a position in `[start, old_end]` is not described
 by the splice at all.
+
+**Byte coordinates (normative):** each splice also gives its three boundaries
+as UTF-8 byte offsets and as points, in the same texts as the positions:
+`start_byte`, `old_end_byte` and their points in the text before operation `i`,
+`new_end_byte` and its point in the text after it. A point's `row` counts the
+U+000A bytes before the offset, including the one in each CR LF pair, and its
+`column` counts the bytes after the last of them. Intermediate texts of a
+multi-operation transition no longer exist after it commits, so a byte-oriented
+consumer cannot recover these coordinates later. Bytes outside
+`[start_byte, old_end_byte)` of the old text are unchanged and reappear outside
+`[start_byte, new_end_byte)` of the new text.
 
 **Endpoint effects (normative):** what happened to a session endpoint inside a
 splice's closed region depends on the requested operation, the endpoint's

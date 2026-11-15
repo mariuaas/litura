@@ -6,24 +6,14 @@
 are issued at the transaction boundary, so an endpoint created and released within one
 intent, including across the parts of a composite, is never issued, and blocks report
 one net interaction event per changed session rather than one per mutation.
-**Follows:** [protocol reconciliation](protocol-reconciliation.md), D3–D15 as revised in review.
 
-**Changes since the first revision.** Public identifiers are issued at
-publication, not at creation (§1). One `SetSelections` resolves all its targets
-against a single state (§2). Edit events report their passive effects on session
-endpoints (§3), because a realized splice does not determine them. Interception
-covers the declared intrinsic requests and separates the engine's obligations
-from the host's. Role-based stickiness is recorded as a v0.1 decision. The
-no-op rule states its consequences for history. Snapshots carry a sequence
-watermark.
-
-The review of the reconciliation report left three connected questions open:
+Three connected questions had to be settled together:
 
 1. What becomes terminal when history disappears?
 2. What survives when a selection changes?
 3. Which transitions does the canonical stream promise to explain?
 
-They have to be settled together, because they meet in the same places. A selection can hold a dead mark whose only way back is an undo entry that a new edit is about to discard. An event that reports a selection change has to say which endpoints persisted and at which document revision their positions mean anything. And whatever reclamation does to that selection must either be visible in the stream or provably change nothing a client can see.
+They meet in the same places. A selection can hold a dead mark whose only way back is an undo entry that a new edit is about to discard. An event that reports a selection change has to say which endpoints persisted and at which document revision their positions mean anything. And whatever reclamation does to that selection must either be visible in the stream or provably change nothing a client can see.
 
 The principle from the review governs every choice below: *resource reclamation must not become an undocumented editing operation, and easier ownership must not erase identities that the causal model relies upon.* We get there by making reclamation unobservable by construction (§1), keeping endpoint identity explicit in every selection change (§2), and stating both the stream's scope and the payload that makes that scope achievable (§3).
 

@@ -25,9 +25,71 @@
             .hash = "N-V-__8AAPRJXAAEwJXx7flJG3JuHIsTmufzs3t8ukhFgmun",
             .lazy = true,
         },
-        .tree_sitter_fennel = .{
-            .url = "https://github.com/alexmozaidze/tree-sitter-fennel/archive/3f0f6b24d599e92460b969aabc4f4c5a914d15a0.tar.gz",
-            .hash = "N-V-__8AAE9HOACMa18NejabSo4gTomtlLo1nXV-2BSltkd7",
+        // Test fixtures for the grammar-diversity suite (`zig build test -Dsyntax-corpus=true`),
+        // fetched only when that option is set. Not part of the library.
+        .corpus_c = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-c/archive/refs/tags/v0.24.2.tar.gz",
+            .hash = "tree_sitter_c-0.24.2-y5boS-ptQADHoCoVfjGT_nFtFQ5LbomIkW0fxG3_cmdB",
+            .lazy = true,
+        },
+        .corpus_cpp = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-cpp/archive/refs/tags/v0.23.4.tar.gz",
+            .hash = "N-V-__8AABV0FwFoNpDVbhYQMEJgss9bkxDorw6hbZVJPCdg",
+            .lazy = true,
+        },
+        .corpus_python = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-python/archive/refs/tags/v0.23.6.tar.gz",
+            .hash = "N-V-__8AAB-iPgCkalcM0Ep6Ru2Um0D3T38-k3fWL4sDd7lE",
+            .lazy = true,
+        },
+        .corpus_rust = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-rust/archive/refs/tags/v0.24.0.tar.gz",
+            .hash = "N-V-__8AAItxbQDcrvshXYdPUV9STG6PaJyk2DZb-uBzQjlw",
+            .lazy = true,
+        },
+        .corpus_go = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-go/archive/refs/tags/v0.25.0.tar.gz",
+            .hash = "N-V-__8AAM9cIgDSWz10pu4QwvyegGvG1p3E3KBTILC3fqGh",
+            .lazy = true,
+        },
+        .corpus_javascript = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-javascript/archive/refs/tags/v0.25.0.tar.gz",
+            .hash = "N-V-__8AANlfOQB4iUiSxpYjpQ5R6BBgFscc5iYIWIu-9plN",
+            .lazy = true,
+        },
+        .corpus_typescript = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-typescript/archive/refs/tags/v0.23.2.tar.gz",
+            .hash = "N-V-__8AALhpIQFpocCrfuYTb_Vzvxj3QG0T-yqi9x1QNRNM",
+            .lazy = true,
+        },
+        .corpus_bash = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-bash/archive/refs/tags/v0.25.0.tar.gz",
+            .hash = "N-V-__8AAMpjowDkEgxFXmUkigmd9fBEaf_9sQiXBDbjcyzt",
+            .lazy = true,
+        },
+        .corpus_java = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-java/archive/refs/tags/v0.23.5.tar.gz",
+            .hash = "N-V-__8AABzeLgA7t_QWhWcrSnR4kOonfpr41QOXvsiuAyhW",
+            .lazy = true,
+        },
+        .corpus_ocaml = .{
+            .url = "https://github.com/tree-sitter/tree-sitter-ocaml/archive/refs/tags/v0.26.0.tar.gz",
+            .hash = "N-V-__8AAE69AATqcyEC1MwCHzJjZF_vQpay8twU8i7seKnJ",
+            .lazy = true,
+        },
+        .corpus_clojure = .{
+            .url = "https://github.com/clj-commons/tree-sitter-clojure/archive/refs/tags/v0.0.13.tar.gz",
+            .hash = "N-V-__8AAKjnDwB4-AHmfV3sGOaCZgP3sMMpuVb3vFsTQpuU",
+            .lazy = true,
+        },
+        .corpus_commonlisp = .{
+            .url = "https://github.com/tree-sitter-grammars/tree-sitter-commonlisp/archive/refs/tags/v0.4.1.tar.gz",
+            .hash = "N-V-__8AAFGyXgAPLfLQMN2Rs5c5mT2VkyHwbgjkxoleXuht",
+            .lazy = true,
+        },
+        .corpus_perl = .{
+            .url = "https://github.com/tree-sitter-perl/tree-sitter-perl/archive/471859e9d8ef320095d7a62d891a49ba729c0dee.tar.gz",
+            .hash = "N-V-__8AAFF9yQFddG9VMW6JVgygFc3U6EkYKYzCqW-r0sfW",
             .lazy = true,
         },
     },

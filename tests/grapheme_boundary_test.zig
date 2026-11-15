@@ -349,11 +349,148 @@ test "SPEC 2.5.1 and 7: the inverse and the reported splice are the realized spl
     // The splice rewrites "e" as "é": a non-empty region with an unchanged grapheme count.
     try std.testing.expectEqualSlices(
         litura.events.RealizedSplice,
-        &.{.{ .start = 0, .old_end = 1, .new_end = 1 }},
+        &.{.{
+            .start = 0,
+            .old_end = 1,
+            .new_end = 1,
+            .start_byte = 0,
+            .old_end_byte = 1,
+            .new_end_byte = 3,
+            .start_point = .{ .row = 0, .column = 0 },
+            .old_end_point = .{ .row = 0, .column = 1 },
+            .new_end_point = .{ .row = 0, .column = 3 },
+        }},
         result.committed.transition.edit.?.splices,
     );
     const inverse = engine.undo_stack.items[0].inverse_ops[0].replace;
     try std.testing.expectEqual(@as(u32, 0), inverse.start);
     try std.testing.expectEqual(@as(u32, 1), inverse.end);
     try std.testing.expectEqualStrings("e", inverse.text);
+}
+
+/// Bytes before grapheme `position` of `text`.
+fn byteOf(text: []const u8, position: u32) u32 {
+    var iter = litura.segmentation.graphemeIterator(text);
+    var offset: u32 = 0;
+    var index: u32 = 0;
+    while (index < position) : (index += 1) offset += @intCast(iter.next().?.len);
+    return offset;
+}
+
+fn pointOf(text: []const u8, byte: u32) litura.events.Point {
+    const prefix = text[0..byte];
+    const row: u32 = @intCast(std.mem.count(u8, prefix, "\n"));
+    const start = if (std.mem.lastIndexOfScalar(u8, prefix, '\n')) |last| last + 1 else 0;
+    return .{ .row = row, .column = @intCast(byte - start) };
+}
+
+/// Checks each splice against the texts before and after its operation, which `shadow`
+/// produces by applying `ops` one at a time.
+fn expectSplicesMatch(
+    shadow: *BufferEngine,
+    ops: []const litura.types.BufferOp,
+    splices: []const litura.events.RealizedSplice,
+) !void {
+    try std.testing.expectEqual(ops.len, splices.len);
+    for (ops, splices) |op, splice| {
+        const before = try shadow.getText();
+        defer allocator.free(before);
+        try submitOps(shadow, &.{op});
+        const after = try shadow.getText();
+        defer allocator.free(after);
+        try std.testing.expectEqual(byteOf(before, splice.start), splice.start_byte);
+        try std.testing.expectEqual(byteOf(before, splice.old_end), splice.old_end_byte);
+        try std.testing.expectEqual(byteOf(after, splice.new_end), splice.new_end_byte);
+        try std.testing.expectEqual(pointOf(before, splice.start_byte), splice.start_point);
+        try std.testing.expectEqual(pointOf(before, splice.old_end_byte), splice.old_end_point);
+        try std.testing.expectEqual(pointOf(after, splice.new_end_byte), splice.new_end_point);
+        // The byte edit describes the change exactly: everything outside it is unchanged.
+        try std.testing.expectEqualStrings(
+            before[0..splice.start_byte],
+            after[0..splice.start_byte],
+        );
+        try std.testing.expectEqualStrings(
+            before[splice.old_end_byte..],
+            after[splice.new_end_byte..],
+        );
+    }
+}
+
+test "realized splices carry exact byte offsets and points for every operation, undo and redo" {
+    // Method: random multi-operation payloads of fragments that join, split and
+    // resegment graphemes (combining marks, CRLF, emoji modifiers, flags); a shadow
+    // engine replays each operation alone to produce the intermediate texts.
+    const fragments = [_][]const u8{
+        "a",
+        "\u{0301}",
+        "\r",
+        "\n",
+        "\r\n",
+        "\u{1f44d}",
+        "\u{1f3fd}",
+        "\u{1f1f3}",
+        "\u{1f1f4}",
+        "ab\ncd",
+    };
+    var prng = std.Random.DefaultPrng.init(0x5911ce);
+    const random = prng.random();
+    var engine = try BufferEngine.initFromText(allocator, "e\nX\n\u{0301}\r\nstart", null);
+    defer engine.deinit();
+    var shadow = try BufferEngine.initFromText(allocator, "e\nX\n\u{0301}\r\nstart", null);
+    defer shadow.deinit();
+    for (0..150) |_| {
+        var ops: [3]litura.types.BufferOp = undefined;
+        const count = 1 + random.uintLessThan(usize, ops.len);
+        // Valid against the text each operation will see: the shadow computes lengths.
+        var probe = try BufferEngine.initFromText(allocator, "", null);
+        defer probe.deinit();
+        const text = try engine.getText();
+        defer allocator.free(text);
+        try submitOps(&probe, &.{.{ .insert = .{ .pos = 0, .text = text } }});
+        for (ops[0..count]) |*op| {
+            const length = probe.graphemeCount();
+            const start = random.uintAtMost(u32, length);
+            const end = start + random.uintAtMost(u32, @min(3, length - start));
+            const fragment = fragments[random.uintLessThan(usize, fragments.len)];
+            op.* = if (random.boolean())
+                .{ .insert = .{ .pos = start, .text = fragment } }
+            else
+                .{ .replace = .{ .start = start, .end = end, .text = fragment } };
+            try submitOps(&probe, &.{op.*});
+        }
+        var result = try engine.submit(.{
+            .id = .{ .value = 0 },
+            .origin = engine.revision,
+            .payload = .{ .buffer_mutation = .{ .ops = ops[0..count] } },
+        });
+        defer result.deinit(allocator);
+        try expectSplicesMatch(&shadow, ops[0..count], result.committed.transition.edit.?.splices);
+
+        // Undo replays the entry's inverse operations; check those too, then redo.
+        if (random.uintLessThan(u8, 3) == 0) {
+            // Copied: the undo consumes the entry and frees its texts.
+            const entry = engine.undo_stack.items[engine.undo_stack.items.len - 1];
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const inverse = try arena.allocator().dupe(litura.types.BufferOp, entry.inverse_ops);
+            for (inverse) |*op| switch (op.*) {
+                .insert => |*added| added.text = try arena.allocator().dupe(u8, added.text),
+                .replace => |*replace| replace.text = try arena.allocator().dupe(u8, replace.text),
+                .delete => {},
+            };
+            var undo = try engine.submit(
+                .{ .id = .{ .value = 0 }, .origin = engine.revision, .payload = .{ .undo = .{} } },
+            );
+            defer undo.deinit(allocator);
+            try expectSplicesMatch(&shadow, inverse, undo.committed.transition.edit.?.splices);
+            var redo = try engine.submit(
+                .{ .id = .{ .value = 0 }, .origin = engine.revision, .payload = .{ .redo = .{} } },
+            );
+            defer redo.deinit(allocator);
+            try submitOps(&shadow, ops[0..count]);
+        }
+        const expected = try shadow.getText();
+        defer allocator.free(expected);
+        try expectText(&engine, expected);
+    }
 }

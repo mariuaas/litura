@@ -23,7 +23,7 @@ test "view provider registration rejects overlapping views atomically" {
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(_: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(_: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             return .{ .view = "tokens", .revision = typed_engine.revision, .kind = .available };
         }
@@ -63,7 +63,12 @@ test "view provider registration rejects overlapping views atomically" {
             return try allocator.alloc(views.SemanticToken, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 
@@ -174,7 +179,7 @@ test "view provider registration rejects overlapping views atomically" {
     try std.testing.expectEqual(views.ViewStateKind.absent, engine.queryViewState("syntax").kind);
 }
 
-test "mutation marks provider stale until token query refreshes" {
+test "a mutation makes the view stale; queries fail until an explicit refresh" {
     const FakeProvider = struct {
         revision: u32 = 0,
         stale: bool = false,
@@ -197,7 +202,7 @@ test "mutation marks provider stale until token query refreshes" {
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(ptr: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(ptr: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             self.revision = typed_engine.revision;
@@ -257,12 +262,12 @@ test "mutation marks provider stale until token query refreshes" {
             engine: *anyopaque,
             _: u32,
             revision: u32,
-        ) ?views.SyntaxNodeInfo {
+        ) anyerror!?views.SyntaxNodeInfo {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self;
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             return .{
-                .ref = .{ .provider = "fake-syntax", .revision = revision, .path = &[_]u32{0} },
+                .ref = .{ .provider = "fake-syntax", .revision = revision, .id = 0 },
                 .kind = "function_definition",
                 .start = 0,
                 .end = typed_engine.graphemeCount(),
@@ -355,6 +360,16 @@ test "mutation marks provider stale until token query refreshes" {
     );
     try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("tokens").kind);
 
+    // A query never refreshes and never serves the stale view as current.
+    try std.testing.expectError(
+        error.ViewStale,
+        engine.queryTokenSpans(0, engine.graphemeCount(), null),
+    );
+    try std.testing.expectEqual(@as(u32, 0), provider.refreshes);
+    try std.testing.expectEqual(
+        views.ViewStateKind.available,
+        engine.refreshView("tokens", .unlimited).kind,
+    );
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
     try std.testing.expectEqual(@as(u32, 1), provider.refreshes);
@@ -365,17 +380,17 @@ test "mutation marks provider stale until token query refreshes" {
     );
 }
 
-test "token queries degrade when refreshed view is unavailable" {
+test "token queries report an unavailable view as an error, not as no tokens" {
     const UnavailableProvider = struct {
         fn provider(self: *@This()) views.ViewProvider {
             return .{ .ptr = self, .vtable = &vtable };
         }
 
         fn stateFor(_: *anyopaque, view: []const u8, revision: u32) views.ViewState {
-            return .{ .view = view, .revision = revision, .kind = .stale };
+            return .{ .view = view, .revision = revision, .kind = .unavailable };
         }
 
-        fn refresh(_: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(_: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             return .{ .view = "tokens", .revision = typed_engine.revision, .kind = .unavailable };
         }
@@ -416,7 +431,12 @@ test "token queries degrade when refreshed view is unavailable" {
             return try allocator.alloc(views.SemanticToken, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 
@@ -493,9 +513,11 @@ test "token queries degrade when refreshed view is unavailable" {
     var provider = UnavailableProvider{};
     try engine.registerViewProvider(provider.provider());
 
-    const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
-    defer std.testing.allocator.free(spans);
-    try std.testing.expectEqual(@as(usize, 0), spans.len);
+    _ = engine.refreshView("tokens", .unlimited);
+    try std.testing.expectError(
+        error.ViewUnavailable,
+        engine.queryTokenSpans(0, engine.graphemeCount(), null),
+    );
 }
 
 test "syntax node refs are revision scoped" {
@@ -518,7 +540,7 @@ test "syntax node refs are revision scoped" {
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(ptr: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(ptr: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             self.revision = typed_engine.revision;
@@ -569,10 +591,10 @@ test "syntax node refs are revision scoped" {
             engine: *anyopaque,
             _: u32,
             revision: u32,
-        ) ?views.SyntaxNodeInfo {
+        ) anyerror!?views.SyntaxNodeInfo {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             return .{
-                .ref = .{ .provider = "fake-syntax", .revision = revision, .path = &[_]u32{0} },
+                .ref = .{ .provider = "fake-syntax", .revision = revision, .id = 0 },
                 .kind = "function_definition",
                 .start = 0,
                 .end = typed_engine.graphemeCount(),
@@ -667,7 +689,7 @@ test "syntax node refs are revision scoped" {
     try std.testing.expectError(error.InvalidArgument, engine.querySyntaxNodeInfo(node.ref));
 }
 
-test "type info queries route through provider state and refresh" {
+test "type info queries route through provider state and an explicit refresh" {
     const FakeProvider = struct {
         revision: u32 = 0,
         stale: bool = false,
@@ -688,7 +710,7 @@ test "type info queries route through provider state and refresh" {
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(ptr: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(ptr: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             self.revision = typed_engine.revision;
@@ -735,7 +757,12 @@ test "type info queries route through provider state and refresh" {
             return try allocator.alloc(views.SemanticToken, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 
@@ -834,11 +861,14 @@ test "type info queries route through provider state and refresh" {
         &engine,
         &[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "x" } }},
     );
+    try std.testing.expectError(error.ViewStale, engine.queryTypeAt(0, null));
+    try std.testing.expectEqual(@as(u32, 0), provider.refreshes);
+    _ = engine.refreshView("type_info", .unlimited);
     _ = (try engine.queryTypeAt(0, null)).?;
     try std.testing.expectEqual(@as(u32, 1), provider.refreshes);
 }
 
-test "hover queries route through provider state and refresh" {
+test "hover queries route through provider state and an explicit refresh" {
     const FakeProvider = struct {
         revision: u32 = 0,
         stale: bool = false,
@@ -859,7 +889,7 @@ test "hover queries route through provider state and refresh" {
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(ptr: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(ptr: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             self.revision = typed_engine.revision;
@@ -906,7 +936,12 @@ test "hover queries route through provider state and refresh" {
             return try allocator.alloc(views.SemanticToken, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 
@@ -1007,6 +1042,9 @@ test "hover queries route through provider state and refresh" {
         &engine,
         &[_]BufferOp{.{ .insert = .{ .pos = engine.graphemeCount(), .text = "x" } }},
     );
+    try std.testing.expectError(error.ViewStale, engine.queryHover(1, null));
+    try std.testing.expectEqual(@as(u32, 0), provider.refreshes);
+    _ = engine.refreshView("hover", .unlimited);
     _ = (try engine.queryHover(1, null)).?;
     try std.testing.expectEqual(@as(u32, 1), provider.refreshes);
 }
@@ -1031,7 +1069,7 @@ test "symbols queries route through provider capabilities and result variants" {
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(ptr: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(ptr: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             self.revision = typed_engine.revision;
@@ -1055,7 +1093,12 @@ test "symbols queries route through provider capabilities and result variants" {
             return try allocator.alloc(views.TokenSpan, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 

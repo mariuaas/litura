@@ -2,7 +2,6 @@
 zig-out/
 .DS_Store
 zig-pkg/
-docs/guide.md
 
 # C precompiled headers
 *.gch

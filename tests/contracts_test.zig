@@ -13,20 +13,20 @@ test "static token spans are served only for the revision they describe" {
 
     // At revision 0 the spans describe the text.
     const ViewStateKind = litura.views.ViewStateKind;
-    try std.testing.expectEqual(ViewStateKind.available, document.refreshView("tokens").kind);
+    const refreshed = document.refreshView("tokens", .unlimited);
+    try std.testing.expectEqual(ViewStateKind.available, refreshed.kind);
     const current = try document.queryTokenSpans(0, 3, null);
     defer std.testing.allocator.free(current);
     try std.testing.expectEqual(@as(usize, 1), current.len);
 
     // After an edit the spans no longer match the text, and refresh cannot fix that.
     try support.edit(&document, &.{.{ .insert = .{ .pos = 0, .text = "xy" } }});
-    const state = document.refreshView("tokens");
+    const state = document.refreshView("tokens", .unlimited);
     try std.testing.expectEqual(ViewStateKind.stale, state.kind);
     try std.testing.expectEqual(@as(?u32, 0), state.revision);
     try std.testing.expectEqual(ViewStateKind.stale, document.queryViewState("tokens").kind);
-    const stale = try document.queryTokenSpans(0, document.graphemeCount(), null);
-    defer std.testing.allocator.free(stale);
-    try std.testing.expectEqual(@as(usize, 0), stale.len);
+    const count = document.graphemeCount();
+    try std.testing.expectError(error.ViewStale, document.queryTokenSpans(0, count, null));
 }
 
 test "Unicode offset maps release partial allocations on failure" {

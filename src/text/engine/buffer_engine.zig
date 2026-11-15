@@ -18,6 +18,15 @@ const session_state = @import("session.zig");
 
 pub const Session = session_state.Session;
 
+/// A view query against a registered view that is not current at the engine's
+/// revision. Queries never refresh (SPEC §2); `refreshView` does.
+pub const ViewError = error{
+    /// The view has not caught up with the current revision.
+    ViewStale,
+    /// The provider cannot produce the view (it reported `unavailable`).
+    ViewUnavailable,
+};
+
 /// How intrinsic requests (anchor and session creation and disposal; SPEC §0.1) fail.
 /// They are synchronous and carry no guards, so a failure is an error to the caller,
 /// not a ValidationReport. Either way nothing is published, no sequence number is
@@ -368,12 +377,18 @@ pub const BufferEngine = struct {
         return provider.stateFor(view, self.revision);
     }
 
-    pub fn refreshView(self: *BufferEngine, view: []const u8) views.ViewState {
-        const provider = self.view_providers.get(view) orelse return views.ViewState.absent(
-            view,
-            self.revision,
-        );
-        return provider.refresh(@ptrCast(self));
+    /// Brings `view` toward the current revision, doing at most what `budget` allows, and
+    /// returns its state. This is the only place derived views do their maintenance work:
+    /// queries never refresh, so the host decides when that work happens.
+    pub fn refreshView(
+        self: *BufferEngine,
+        view: []const u8,
+        budget: views.RefreshBudget,
+    ) views.ViewState {
+        const provider = self.view_providers.get(view) orelse {
+            return views.ViewState.absent(view, self.revision);
+        };
+        return provider.refresh(@ptrCast(self), budget);
     }
 
     /// Creates an anchor in capacity the caller reserved. Does not allocate or fail.
@@ -1389,12 +1404,13 @@ pub const BufferEngine = struct {
             try pending.deletion_metas.append(self.allocator, meta);
         }
 
+        // Byte coordinates come from the text before the splice: the start by lookup, the
+        // ends by advancing over the old region and over its replacement.
+        const realized = try self.realizedSplice(splice, restoredText(inverse), edit.text);
         try self.table.applySplice(splice, edit.text);
         pending.inverse_ops.appendAssumeCapacity(inverse);
         inverse_owned = false;
-        pending.splices.appendAssumeCapacity(
-            .{ .start = splice.start, .old_end = splice.old_end, .new_end = splice.new_end },
-        );
+        pending.splices.appendAssumeCapacity(realized);
         try self.rebaseAnchorsForSplice(splice, edit.text, restoredText(inverse));
         if (edit_anchors) |result| {
             // Created after this operation's own rebasing, so only later operations move them.
@@ -1405,6 +1421,48 @@ pub const BufferEngine = struct {
             };
         }
         return null;
+    }
+
+    /// A splice in grapheme, byte and point coordinates, computed before it is applied.
+    /// `old_text` is the splice's old region; the new region is that text with the
+    /// inserted text between its left and right context.
+    fn realizedSplice(
+        self: *const BufferEngine,
+        splice: Splice,
+        old_text: []const u8,
+        inserted: []const u8,
+    ) !events.RealizedSplice {
+        const start_byte = try self.table.byteOffset(splice.start);
+        const start = try self.table.pointAtByte(start_byte);
+        const start_point = events.Point{ .row = start.row, .column = start.column };
+        const left = old_text[0..splice.left_context_bytes];
+        const right = old_text[old_text.len - splice.right_context_bytes ..];
+        const new_bytes = left.len + inserted.len + right.len;
+        return .{
+            .start = splice.start,
+            .old_end = splice.old_end,
+            .new_end = splice.new_end,
+            .start_byte = start_byte,
+            .old_end_byte = start_byte + @as(u32, @intCast(old_text.len)),
+            .new_end_byte = start_byte + @as(u32, @intCast(new_bytes)),
+            .start_point = start_point,
+            .old_end_point = advancePoint(start_point, old_text),
+            .new_end_point = advancePoint(
+                advancePoint(advancePoint(start_point, left), inserted),
+                right,
+            ),
+        };
+    }
+
+    /// The point reached from `point` after `text`.
+    fn advancePoint(point: events.Point, text: []const u8) events.Point {
+        const last = std.mem.lastIndexOfScalar(u8, text, '\n') orelse {
+            return .{ .row = point.row, .column = point.column + @as(u32, @intCast(text.len)) };
+        };
+        return .{
+            .row = point.row + @as(u32, @intCast(std.mem.count(u8, text, "\n"))),
+            .column = @intCast(text.len - last - 1),
+        };
     }
 
     /// The start (Weak) and end (Sticky) of an operation's inserted text, projected onto
@@ -1729,6 +1787,23 @@ pub const BufferEngine = struct {
         };
     }
 
+    /// The provider of `view` when it is current at the engine's revision; null when no
+    /// provider is registered. A registered view that is not current fails: queries never
+    /// refresh, and stale data is never served as current (SPEC §2). Bring a view up to
+    /// date with `refreshView`.
+    fn currentProvider(self: *const BufferEngine, view: []const u8) ViewError!?views.ViewProvider {
+        const provider = self.view_providers.get(view) orelse return null;
+        return switch (provider.stateFor(view, self.revision).kind) {
+            .available, .partial => provider,
+            .stale => error.ViewStale,
+            .unavailable => error.ViewUnavailable,
+            .absent => null,
+        };
+    }
+
+    /// Spans intersecting `[start, end)` at the current revision; the caller frees the
+    /// slice. Empty without a token provider; error.ViewStale or error.ViewUnavailable
+    /// when the provider is not current.
     pub fn queryTokenSpans(
         self: *BufferEngine,
         start: u32,
@@ -1740,17 +1815,9 @@ pub const BufferEngine = struct {
         if (start > end) return error.InvalidRange;
         if (end > self.graphemeCount()) return error.OutOfRange;
 
-        const provider = self.view_providers.get("tokens") orelse return try self.allocator.alloc(
-            views.TokenSpan,
-            0,
-        );
-        var state = provider.stateFor("tokens", self.revision);
-        if (state.kind == .stale) {
-            state = provider.refresh(@ptrCast(self));
-        }
-        if (state.kind != .available and state.kind != .partial) {
+        const provider = try self.currentProvider("tokens") orelse {
             return try self.allocator.alloc(views.TokenSpan, 0);
-        }
+        };
         return try provider.tokenSpans(self.allocator, @ptrCast(self), start, end, self.revision);
     }
 
@@ -1766,18 +1833,9 @@ pub const BufferEngine = struct {
         if (end) |e| if (e > self.graphemeCount()) return error.OutOfRange;
         if (start != null and end != null and start.? > end.?) return error.InvalidRange;
 
-        const provider = self.view_providers.get(
-            "diagnostics",
-        ) orelse return try self.allocator.alloc(
-            views.Diagnostic,
-            0,
-        );
-        var state = provider.stateFor("diagnostics", self.revision);
-        if (state.kind == .stale) state = provider.refresh(@ptrCast(@constCast(self)));
-        if (state.kind != .available and state.kind != .partial) return try self.allocator.alloc(
-            views.Diagnostic,
-            0,
-        );
+        const provider = try self.currentProvider("diagnostics") orelse {
+            return try self.allocator.alloc(views.Diagnostic, 0);
+        };
         return try provider.diagnosticList(
             self.allocator,
             @ptrCast(@constCast(self)),
@@ -1798,18 +1856,9 @@ pub const BufferEngine = struct {
         if (start > end) return error.InvalidRange;
         if (end > self.graphemeCount()) return error.OutOfRange;
 
-        const provider = self.view_providers.get(
-            "semantic_tokens",
-        ) orelse return try self.allocator.alloc(
-            views.SemanticToken,
-            0,
-        );
-        var state = provider.stateFor("semantic_tokens", self.revision);
-        if (state.kind == .stale) state = provider.refresh(@ptrCast(@constCast(self)));
-        if (state.kind != .available and state.kind != .partial) return try self.allocator.alloc(
-            views.SemanticToken,
-            0,
-        );
+        const provider = try self.currentProvider("semantic_tokens") orelse {
+            return try self.allocator.alloc(views.SemanticToken, 0);
+        };
         return try provider.semanticTokens(
             self.allocator,
             @ptrCast(@constCast(self)),
@@ -1819,6 +1868,9 @@ pub const BufferEngine = struct {
         );
     }
 
+    /// The smallest named node around the grapheme at `position`, or null when there is
+    /// none or no syntax provider. Errors (a view that is not current, allocation
+    /// failure) are reported as errors, never as absence.
     pub fn queryEnclosingSyntaxNode(
         self: *BufferEngine,
         position: u32,
@@ -1828,23 +1880,18 @@ pub const BufferEngine = struct {
         if (requested_revision != self.revision) return error.InvalidArgument;
         try self.table.validatePosition(position);
 
-        const provider = self.view_providers.get("syntax") orelse return null;
-        var state = provider.stateFor("syntax", self.revision);
-        if (state.kind == .stale) {
-            state = provider.refresh(@ptrCast(self));
-        }
-        if (state.kind != .available and state.kind != .partial) {
-            return null;
-        }
-        return provider.enclosingNode(@ptrCast(self), position, self.revision);
+        const provider = try self.currentProvider("syntax") orelse return null;
+        return try provider.enclosingNode(@ptrCast(self), position, self.revision);
     }
 
+    /// Resolves a node reference. A reference from another revision is rejected with
+    /// error.InvalidArgument; one the provider does not know, with error.KeyError.
     pub fn querySyntaxNodeInfo(
         self: *BufferEngine,
         ref: views.SyntaxNodeRef,
     ) !views.SyntaxNodeInfo {
         if (ref.revision != self.revision) return error.InvalidArgument;
-        const provider = self.view_providers.get("syntax") orelse return error.KeyError;
+        const provider = try self.currentProvider("syntax") orelse return error.KeyError;
         return provider.nodeInfo(@ptrCast(self), ref);
     }
 
@@ -1853,14 +1900,7 @@ pub const BufferEngine = struct {
         if (requested_revision != self.revision) return error.InvalidArgument;
         try self.table.validatePosition(position);
 
-        const provider = self.view_providers.get("type_info") orelse return null;
-        var state = provider.stateFor("type_info", self.revision);
-        if (state.kind == .stale) {
-            state = provider.refresh(@ptrCast(self));
-        }
-        if (state.kind != .available and state.kind != .partial) {
-            return null;
-        }
+        const provider = try self.currentProvider("type_info") orelse return null;
         return try provider.typeAt(@ptrCast(self), position, self.revision);
     }
 
@@ -1869,14 +1909,7 @@ pub const BufferEngine = struct {
         if (requested_revision != self.revision) return error.InvalidArgument;
         try self.table.validatePosition(position);
 
-        const provider = self.view_providers.get("hover") orelse return null;
-        var state = provider.stateFor("hover", self.revision);
-        if (state.kind == .stale) {
-            state = provider.refresh(@ptrCast(self));
-        }
-        if (state.kind != .available and state.kind != .partial) {
-            return null;
-        }
+        const provider = try self.currentProvider("hover") orelse return null;
         return try provider.hoverAt(@ptrCast(self), position, self.revision);
     }
 
@@ -1889,10 +1922,7 @@ pub const BufferEngine = struct {
         if (requested_revision != self.revision) return error.InvalidArgument;
         try self.table.validatePosition(position);
 
-        const provider = self.view_providers.get("symbols") orelse return .not_supported;
-        var state = provider.stateFor("symbols", self.revision);
-        if (state.kind == .stale) state = provider.refresh(@ptrCast(self));
-        if (state.kind != .available and state.kind != .partial) return .none;
+        const provider = try self.currentProvider("symbols") orelse return .not_supported;
         return try provider.definition(@ptrCast(self), position, self.revision);
     }
 
@@ -1905,10 +1935,7 @@ pub const BufferEngine = struct {
         if (requested_revision != self.revision) return error.InvalidArgument;
         try self.table.validatePosition(position);
 
-        const provider = self.view_providers.get("symbols") orelse return .not_supported;
-        var state = provider.stateFor("symbols", self.revision);
-        if (state.kind == .stale) state = provider.refresh(@ptrCast(self));
-        if (state.kind != .available and state.kind != .partial) return .{ .locations = &.{} };
+        const provider = try self.currentProvider("symbols") orelse return .not_supported;
         return try provider.references(@ptrCast(self), position, self.revision);
     }
 
@@ -1921,10 +1948,7 @@ pub const BufferEngine = struct {
         if (requested_revision != self.revision) return error.InvalidArgument;
         try self.table.validatePosition(position);
 
-        const provider = self.view_providers.get("symbols") orelse return .not_supported;
-        var state = provider.stateFor("symbols", self.revision);
-        if (state.kind == .stale) state = provider.refresh(@ptrCast(self));
-        if (state.kind != .available and state.kind != .partial) return .none;
+        const provider = try self.currentProvider("symbols") orelse return .not_supported;
         return try provider.renamePrepare(@ptrCast(self), position, self.revision);
     }
 
@@ -1994,7 +2018,7 @@ test "rollbackRegisteredViews removes inserted views without freeing borrowed ke
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(_: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(_: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             return .{ .view = "syntax", .revision = typed_engine.revision, .kind = .available };
         }
@@ -2034,7 +2058,12 @@ test "rollbackRegisteredViews removes inserted views without freeing borrowed ke
             return try allocator.alloc(views.SemanticToken, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 
@@ -2132,7 +2161,7 @@ test "registerViewProviders rolls back partial registration when a later put fai
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(_: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(_: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             return .{ .view = "syntax", .revision = typed_engine.revision, .kind = .available };
         }
@@ -2172,7 +2201,12 @@ test "registerViewProviders rolls back partial registration when a later put fai
             return try allocator.alloc(views.SemanticToken, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 

@@ -701,3 +701,94 @@ test "cursor retreats across multi-level internal tree" {
     }
     try std.testing.expect(!cursor.retreat());
 }
+
+test "byte, grapheme and point coordinates agree with a scan of the whole text" {
+    // Method: build documents from many small insertions, so they span many pieces and
+    // leaves, from fragments that join and split graphemes; check every grapheme and
+    // every byte against a direct computation over the full text.
+    const fragments = [_][]const u8{
+        "a",
+        "\u{e9}",
+        "e",
+        "\u{0301}",
+        "\r",
+        "\n",
+        "\r\n",
+        "\u{1f44d}\u{1f3fd}",
+        "\u{1f1f3}\u{1f1f4}",
+        "xyz ",
+    };
+    var prng = std.Random.DefaultPrng.init(0xb17e);
+    const random = prng.random();
+    for (0..20) |_| {
+        var table = try litura.piece_table.PieceTable.init(std.testing.allocator);
+        defer table.deinit();
+        for (0..120) |_| {
+            const fragment = fragments[random.uintLessThan(usize, fragments.len)];
+            try table.insert(random.uintAtMost(u32, table.graphemeCount()), fragment);
+        }
+        const text = try table.getText();
+        defer std.testing.allocator.free(text);
+
+        // Grapheme start bytes of the whole text, segmented at once.
+        var starts: std.ArrayListUnmanaged(u32) = .empty;
+        defer starts.deinit(std.testing.allocator);
+        var iter = litura.segmentation.graphemeIterator(text);
+        var offset: u32 = 0;
+        while (iter.next()) |cluster| {
+            try starts.append(std.testing.allocator, offset);
+            offset += @intCast(cluster.len);
+        }
+        try starts.append(std.testing.allocator, offset);
+        try std.testing.expectEqual(@as(usize, table.graphemeCount() + 1), starts.items.len);
+
+        for (starts.items, 0..) |byte, position| {
+            try std.testing.expectEqual(byte, try table.byteOffset(@intCast(position)));
+        }
+        var grapheme: u32 = 0;
+        var row: u32 = 0;
+        var row_start: u32 = 0;
+        for (0..text.len + 1) |index| {
+            const byte: u32 = @intCast(index);
+            while (starts.items[grapheme + 1] <= byte and grapheme + 1 < starts.items.len - 1) {
+                grapheme += 1;
+            }
+            const boundary = starts.items[grapheme] == byte or byte == text.len;
+            const down: u32 = if (byte == text.len) table.graphemeCount() else grapheme;
+            try std.testing.expectEqual(down, try table.positionAtByte(byte, .down));
+            try std.testing.expectEqual(
+                if (boundary) down else down + 1,
+                try table.positionAtByte(byte, .up),
+            );
+            try std.testing.expectEqual(
+                litura.piece_table.Point{ .row = row, .column = byte - row_start },
+                try table.pointAtByte(byte),
+            );
+            const chunk = try table.chunkAtByte(byte);
+            try std.testing.expect(std.mem.startsWith(u8, text[byte..], chunk));
+            try std.testing.expect(chunk.len > 0 or byte == text.len);
+            if (index < text.len and text[index] == '\n') {
+                row += 1;
+                row_start = byte + 1;
+            }
+        }
+        try std.testing.expectError(
+            error.OutOfRange,
+            table.positionAtByte(@intCast(text.len + 1), .down),
+        );
+
+        // The batch form agrees with one lookup per offset, duplicates included.
+        var batch: [64]u32 = undefined;
+        for (&batch) |*byte| byte.* = random.uintAtMost(u32, @intCast(text.len));
+        std.mem.sort(u32, &batch, {}, std.sort.asc(u32));
+        var expected: [64]u32 = undefined;
+        for (batch, &expected) |byte, *position| position.* = try table.positionAtByte(byte, .down);
+        try table.positionsAtBytes(&batch);
+        try std.testing.expectEqualSlices(u32, &expected, &batch);
+        var descending = [_]u32{ 1, 0 };
+        try std.testing.expectError(error.InvalidRange, table.positionsAtBytes(&descending));
+        try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, &descending);
+        var past_end = [_]u32{ 0, @intCast(text.len + 1) };
+        try std.testing.expectError(error.OutOfRange, table.positionsAtBytes(&past_end));
+    }
+}

@@ -1,8 +1,8 @@
 # Litura
 
-Litura is a document editing library for Zig, distilled from Substrate, a private project I've been working on. It keeps text, anchors, selections and edit history together, with revision-checked edits and optional syntax views.
+Litura is a document editing library for Zig, distilled from a private project I've been working on. It keeps text, anchors, selections and edit history together, with revision-checked edits and optional syntax views.
 
-It's an early draft. The API is still moving, and there are [known allocation-failure and transaction-safety gaps](docs/known-issues.md). It isn't hardened yet. The [draft Litura specification](docs/buffer-protocol/SPEC.md) describes the protocol we're working towards; the [implementation status](docs/buffer-protocol/STATUS.md) covers what works today.
+Early draft, so the API is still moving, spec and code still hardening. [Known issues](docs/known-issues.md) lists costs and remaining gaps. The [draft specification](docs/buffer-protocol/SPEC.md) is the protocol we're working towards; [implementation status](docs/buffer-protocol/STATUS.md) is what of that protocol works today. Callers moving from an earlier snapshot should read [migration](docs/migration.md).
 
 ## Trying it
 
@@ -15,13 +15,29 @@ zig build test
 zig build example
 ```
 
-Tree-sitter support for Lua, Zig and Fennel is optional:
+The package exports one module, `litura`. `BufferEngine` is the document. Intents, sessions and results live in `litura.types`; a committed change returns an owned `litura.events.Block`. Start with the [basic example](examples/basic.zig).
+
+For a sibling checkout, add `.litura = .{ .path = "../litura" }` to `build.zig.zon` and:
+
+```zig
+const litura = b.dependency("litura", .{
+    .target = target,
+    .optimize = optimize,
+    .@"tree-sitter" = false,
+});
+exe.root_module.addImport("litura", litura.module("litura"));
+```
+
+Tree-sitter support is optional and uses Zig's C toolchain. Lua and Zig grammars are built in; other grammars attach through `tree_sitter.Grammar`. After `attach`, call `refreshView` before querying tokens or syntax, or the query fails with `error.ViewStale`.
 
 ```sh
 zig build test -Dtree-sitter=true
+zig build example -Dtree-sitter=true
 ```
 
-The package exports one module, `litura`. Start with the [basic example](examples/basic.zig). The core uses `zg` for Unicode handling and runs independently of Substrate's application runtime.
+`-Dsyntax-corpus=true` runs the views against further grammars pinned as test fixtures and fetched only for that run. Use `-Doptimize=ReleaseSafe`; it keeps the run to minutes.
+
+The core uses `zg` for Unicode handling and runs independently of Substrate's application runtime.
 
 Before submitting changes:
 

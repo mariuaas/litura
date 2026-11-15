@@ -76,15 +76,31 @@ pub const Edge = enum { start, end };
 /// The kinds of buffer operation in one edit; `mixed` when they differ.
 pub const EditClass = enum { insert, delete, replace, mixed };
 
-/// One buffer operation's realized splice (SPEC §1.4). `start` and `old_end` are
-/// positions in the text just before the operation; `new_end` is a position in the
-/// text just after it. Positions before `start` are unchanged by the splice, positions
-/// after `old_end` shift by `new_end - old_end`, and positions in `[start, old_end]`
-/// are not described by the splice at all.
+/// A byte offset's row and column: `row` counts the `\n` bytes before it, including
+/// the one in each CRLF pair, and `column` counts the bytes since the last of them. This
+/// is Tree-sitter's convention; Litura's own line queries count line-feed graphemes.
+pub const Point = struct {
+    row: u32,
+    column: u32,
+};
+
+/// One buffer operation's realized splice (SPEC §1.4, §7.1), in grapheme positions and
+/// in byte offsets with points. `start`, `old_end` and their byte and point forms
+/// describe the text just before the operation; `new_end` and its forms the text just
+/// after it. Positions before `start` are unchanged by the splice, positions after
+/// `old_end` shift by `new_end - old_end`, and positions in `[start, old_end]` are not
+/// described by the splice at all. The byte forms give the same edit to consumers that
+/// count bytes, such as an incremental parser.
 pub const RealizedSplice = struct {
     start: u32,
     old_end: u32,
     new_end: u32,
+    start_byte: u32,
+    old_end_byte: u32,
+    new_end_byte: u32,
+    start_point: Point,
+    old_end_point: Point,
+    new_end_point: Point,
 };
 
 /// The explicit effect of an edit on one session endpoint. `old` is the endpoint at

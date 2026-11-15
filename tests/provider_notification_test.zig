@@ -208,14 +208,17 @@ const Prober = struct {
         self.count(engine.save("never-written.txt"));
         self.count(engine.registerViewProvider(self.static.provider()));
 
-        // Reads, including a lazy provider refresh and a snapshot, remain available.
+        // Reads and view maintenance remain available: refreshing changes no engine
+        // state. A stale view is reported as such, not served.
         const text = engine.getText() catch return;
         defer engine.allocator.free(text);
-        const spans = engine.queryTokenSpans(0, engine.graphemeCount(), null) catch return;
-        defer engine.allocator.free(spans);
+        _ = engine.refreshView("tokens", .unlimited);
+        const stale = if (engine.queryTokenSpans(0, engine.graphemeCount(), null)) |spans| blk: {
+            engine.allocator.free(spans);
+            break :blk false;
+        } else |err| err == error.ViewStale;
         var snapshot = engine.snapshot(engine.allocator) catch return;
         defer snapshot.deinit(engine.allocator);
-        const stale = engine.queryViewState("tokens").kind != .available;
         self.reads_ok = std.mem.eql(u8, text, "abc") and stale and snapshot.next_sequence == 2;
     }
 };

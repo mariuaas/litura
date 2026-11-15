@@ -762,7 +762,7 @@ test "optional view guards evaluate against available diagnostics and semantic t
             return views.ViewState.absent(view, revision);
         }
 
-        fn refresh(_: *anyopaque, engine_ptr: *anyopaque) views.ViewState {
+        fn refresh(_: *anyopaque, engine_ptr: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const engine_ptr_typed: *BufferEngine = @ptrCast(@alignCast(engine_ptr));
             return .{ .view = "diagnostics", .revision = engine_ptr_typed.revision, .kind = .available };
         }
@@ -824,7 +824,7 @@ test "optional view guards evaluate against available diagnostics and semantic t
             return tokens;
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 

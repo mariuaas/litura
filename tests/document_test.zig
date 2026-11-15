@@ -20,7 +20,7 @@ test "engine reports registered view capabilities and states" {
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(_: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(_: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             return .{ .view = "tokens", .revision = typed_engine.revision, .kind = .available };
         }
@@ -60,7 +60,12 @@ test "engine reports registered view capabilities and states" {
             return try allocator.alloc(views.SemanticToken, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 
@@ -162,7 +167,7 @@ test "registerViewProviders rejects conflicting batch during preflight" {
             return .{ .view = view, .revision = revision, .kind = .available };
         }
 
-        fn refresh(_: *anyopaque, engine: *anyopaque) views.ViewState {
+        fn refresh(_: *anyopaque, engine: *anyopaque, _: views.RefreshBudget) views.ViewState {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
             return .{ .view = "syntax", .revision = typed_engine.revision, .kind = .available };
         }
@@ -202,7 +207,12 @@ test "registerViewProviders rejects conflicting batch during preflight" {
             return try allocator.alloc(views.SemanticToken, 0);
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) ?views.SyntaxNodeInfo {
+        fn enclosingNode(
+            _: *anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 

@@ -157,6 +157,17 @@ pub const GraphemeCursor = struct {
     }
 };
 
+/// A byte offset's row and column in Tree-sitter's convention: `row` counts the `\n`
+/// bytes before it, including the one in each CRLF pair, and `column` counts the bytes
+/// since the last of them.
+pub const Point = struct {
+    row: u32,
+    column: u32,
+};
+
+/// Which grapheme boundary a byte inside a grapheme maps to.
+pub const Rounding = enum { down, up };
+
 pub const LineCol = struct {
     line: u32,
     col: u32,
@@ -349,6 +360,175 @@ pub const PieceTable = struct {
         try self.validatePosition(pos);
         if (pos == 0) return 0;
         return self.newlineCountBeforeNode(self.root, pos);
+    }
+
+    /// Bytes before grapheme `pos`. Logarithmic, plus a scan within one piece.
+    pub fn byteOffset(self: *const PieceTable, pos: u32) Error!u32 {
+        try self.validatePosition(pos);
+        const total = self.root.summary();
+        if (pos == total.graphemes) return total.bytes;
+        const at = self.pieceAt(.graphemes, pos);
+        const text = self.pieceText(at.piece.?);
+        const local = pos - at.before.graphemes;
+        const split = self.seg.splitAtGrapheme(text, local) catch return error.OutOfRange;
+        return at.before.bytes + @as(u32, @intCast(split.left.len));
+    }
+
+    /// The grapheme boundary at `byte`; a byte inside a grapheme maps to the boundary
+    /// before it (`down`) or after it (`up`). Logarithmic, plus a scan within one piece.
+    pub fn positionAtByte(self: *const PieceTable, byte: u32, rounding: Rounding) Error!u32 {
+        const total = self.root.summary();
+        if (byte > total.bytes) return error.OutOfRange;
+        if (byte == total.bytes) return total.graphemes;
+        const at = self.pieceAt(.bytes, byte);
+        const local = byte - at.before.bytes;
+        var iter = self.seg.iterator(self.pieceText(at.piece.?));
+        var offset: u32 = 0;
+        var index: u32 = 0;
+        while (iter.next()) |cluster| : (index += 1) {
+            if (offset == local) break;
+            const next = offset + @as(u32, @intCast(cluster.len));
+            if (next > local) return at.before.graphemes + index + @intFromBool(rounding == .up);
+            offset = next;
+        }
+        return at.before.graphemes + index;
+    }
+
+    /// Replaces each of the byte offsets in `bytes`, which must be ascending, with its
+    /// grapheme boundary, rounding down. One descent per piece reached, and each piece is
+    /// segmented at most once, so mapping many nearby offsets costs about as much as
+    /// scanning their range. Rejects descending offsets with error.InvalidRange and offsets
+    /// past the end with error.OutOfRange, leaving `bytes` unchanged.
+    pub fn positionsAtBytes(self: *const PieceTable, bytes: []u32) Error!void {
+        const total = self.root.summary();
+        var previous: u32 = 0;
+        for (bytes) |byte| {
+            if (byte < previous) return error.InvalidRange;
+            if (byte > total.bytes) return error.OutOfRange;
+            previous = byte;
+        }
+        var index: usize = 0;
+        while (index < bytes.len) {
+            const byte = bytes[index];
+            if (byte == total.bytes) {
+                bytes[index] = total.graphemes;
+                index += 1;
+                continue;
+            }
+            const at = self.pieceAt(.bytes, byte);
+            const text = self.pieceText(at.piece.?);
+            const piece_end = at.before.bytes + @as(u32, @intCast(text.len));
+            var iter = self.seg.iterator(text);
+            var cluster = iter.next();
+            var offset: u32 = 0;
+            var grapheme: u32 = 0;
+            while (index < bytes.len and bytes[index] < piece_end) : (index += 1) {
+                const local = bytes[index] - at.before.bytes;
+                while (cluster) |current| {
+                    if (offset + current.len > local) break;
+                    offset += @intCast(current.len);
+                    grapheme += 1;
+                    cluster = iter.next();
+                }
+                bytes[index] = at.before.graphemes + grapheme;
+            }
+        }
+    }
+
+    /// The row and byte column of `byte` (see `Point`). Logarithmic, plus scans within
+    /// two pieces.
+    pub fn pointAtByte(self: *const PieceTable, byte: u32) Error!Point {
+        const total = self.root.summary();
+        if (byte > total.bytes) return error.OutOfRange;
+        const row = if (byte == total.bytes) total.line_feeds else blk: {
+            const at = self.pieceAt(.bytes, byte);
+            const text = self.pieceText(at.piece.?);
+            const local = byte - at.before.bytes;
+            const line_feeds = std.mem.count(u8, text[0..local], "\n");
+            break :blk at.before.line_feeds + @as(u32, @intCast(line_feeds));
+        };
+        return .{ .row = row, .column = byte - self.rowStartByte(row) };
+    }
+
+    /// The byte just after the `row`th line feed, or 0 for row 0.
+    fn rowStartByte(self: *const PieceTable, row: u32) u32 {
+        if (row == 0) return 0;
+        const at = self.pieceAt(.line_feeds, row - 1);
+        const text = self.pieceText(at.piece.?);
+        var remaining = row - 1 - at.before.line_feeds;
+        var index: usize = 0;
+        while (true) : (index += 1) {
+            if (text[index] != '\n') continue;
+            if (remaining == 0) return at.before.bytes + @as(u32, @intCast(index)) + 1;
+            remaining -= 1;
+        }
+    }
+
+    /// The contiguous bytes stored from `byte` to the end of its piece, borrowed until the
+    /// next edit; empty at the end of the text. Reading a document chunk by chunk this way
+    /// copies nothing.
+    pub fn chunkAtByte(self: *const PieceTable, byte: u32) Error![]const u8 {
+        const total = self.root.summary();
+        if (byte > total.bytes) return error.OutOfRange;
+        if (byte == total.bytes) return "";
+        const at = self.pieceAt(.bytes, byte);
+        return self.pieceText(at.piece.?)[byte - at.before.bytes ..];
+    }
+
+    const Measure = enum { graphemes, bytes, line_feeds };
+
+    /// Counts of everything before a location.
+    const Prefix = struct {
+        graphemes: u32 = 0,
+        bytes: u32 = 0,
+        line_feeds: u32 = 0,
+
+        fn add(self: *Prefix, summary: Summary) void {
+            self.graphemes += summary.graphemes;
+            self.bytes += summary.bytes;
+            self.line_feeds += summary.line_feeds;
+        }
+    };
+
+    fn measureOf(summary: Summary, measure: Measure) u32 {
+        return switch (measure) {
+            .graphemes => summary.graphemes,
+            .bytes => summary.bytes,
+            .line_feeds => summary.line_feeds,
+        };
+    }
+
+    /// The piece holding unit `target` of `measure`, which the caller checked is below
+    /// the total, and the counts of everything before that piece.
+    fn pieceAt(self: *const PieceTable, measure: Measure, target: u32) struct {
+        piece: ?nodes.Piece,
+        before: Prefix,
+    } {
+        var node = self.root;
+        var before = Prefix{};
+        var remaining = target;
+        while (true) switch (node) {
+            .internal => |internal| {
+                for (internal.children.items) |child| {
+                    const units = measureOf(child.summary(), measure);
+                    if (remaining < units) {
+                        node = child;
+                        break;
+                    }
+                    remaining -= units;
+                    before.add(child.summary());
+                } else return .{ .piece = null, .before = before };
+            },
+            .leaf => |leaf| {
+                for (leaf.pieces.items) |piece| {
+                    const units = measureOf(piece.summary, measure);
+                    if (remaining < units) return .{ .piece = piece, .before = before };
+                    remaining -= units;
+                    before.add(piece.summary);
+                }
+                return .{ .piece = null, .before = before };
+            },
+        };
     }
 
     pub fn getText(self: *const PieceTable) ![]u8 {

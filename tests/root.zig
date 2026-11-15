@@ -24,5 +24,9 @@ comptime {
     _ = litura.summaries;
     _ = litura.segmentation;
     _ = litura.engine_view;
-    if (litura.tree_sitter_enabled) _ = @import("tree_sitter_test.zig");
+    if (litura.tree_sitter_enabled) {
+        _ = @import("tree_sitter_test.zig");
+        _ = @import("syntax_incremental_test.zig");
+        if (@import("syntax_corpus_options").enabled) _ = @import("syntax_corpus_test.zig");
+    }
 }

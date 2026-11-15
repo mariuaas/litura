@@ -92,7 +92,11 @@ pub const BracketSummary = struct {
 pub const Summary = struct {
     graphemes: u32,
     bytes: u32,
+    /// Line-feed graphemes. A CRLF pair is one grapheme and is not counted.
     newlines: u32,
+    /// `\n` bytes, including the one in each CRLF pair: the rows of a byte-and-point
+    /// coordinate system such as Tree-sitter's.
+    line_feeds: u32,
     words: WordRunSummary,
     brackets: BracketSummary,
 
@@ -100,6 +104,7 @@ pub const Summary = struct {
         .graphemes = 0,
         .bytes = 0,
         .newlines = 0,
+        .line_feeds = 0,
         .words = WordRunSummary.empty,
         .brackets = BracketSummary.empty,
     };
@@ -122,6 +127,7 @@ pub const Summary = struct {
             .graphemes = grapheme_count,
             .bytes = @intCast(text.len),
             .newlines = newline_count,
+            .line_feeds = @intCast(std.mem.count(u8, text, "\n")),
             .words = wordRunSummary(text),
             .brackets = bracketSummary(seg, text),
         };
@@ -132,6 +138,7 @@ pub const Summary = struct {
             .graphemes = left.graphemes + right.graphemes,
             .bytes = left.bytes + right.bytes,
             .newlines = left.newlines + right.newlines,
+            .line_feeds = left.line_feeds + right.line_feeds,
             .words = WordRunSummary.merge(left.words, right.words),
             .brackets = BracketSummary.merge(left.brackets, right.brackets),
         };
@@ -154,6 +161,7 @@ fn applyBracketDepth(depth: *BracketDepth, delta: i32) void {
 fn asciiSummary(text: []const u8) ?Summary {
     var grapheme_count: u32 = 0;
     var newline_count: u32 = 0;
+    var crlf_count: u32 = 0;
     var word_runs: u32 = 0;
     var in_word = false;
     var starts_word = false;
@@ -173,6 +181,7 @@ fn asciiSummary(text: []const u8) ?Summary {
 
         const crlf = ch == '\r' and index + 1 < text.len and text[index + 1] == '\n';
         if (ch == '\n') newline_count += 1;
+        crlf_count += @intFromBool(crlf);
 
         const is_word = !asciiWhitespace(ch);
         if (first) {
@@ -218,6 +227,7 @@ fn asciiSummary(text: []const u8) ?Summary {
         .graphemes = grapheme_count,
         .bytes = @intCast(text.len),
         .newlines = newline_count,
+        .line_feeds = newline_count + crlf_count,
         .words = if (first) WordRunSummary.empty else .{
             .is_empty = false,
             .runs = word_runs,
@@ -410,6 +420,7 @@ test "summarize ascii CRLF preserves grapheme cluster semantics" {
     try std.testing.expectEqual(@as(u32, 3), s.graphemes);
     try std.testing.expectEqual(@as(u32, 4), s.bytes);
     try std.testing.expectEqual(@as(u32, 0), s.newlines);
+    try std.testing.expectEqual(@as(u32, 1), s.line_feeds);
     try std.testing.expectEqual(@as(u32, 2), s.words.runs);
 }
 

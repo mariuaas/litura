@@ -7,41 +7,6 @@ const BufferEngine = litura.BufferEngine;
 const TreeSitterTokenProvider = litura.tree_sitter.TreeSitterTokenProvider;
 const views = litura.views;
 
-test "tree-sitter fennel tokens attach and query" {
-    var engine = try BufferEngine.initFromText(
-        std.testing.allocator,
-        "(local x 1)\n(fn [a] (print a))\n",
-        null,
-    );
-    defer engine.deinit();
-
-    try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "fennel"));
-    try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("tokens").kind);
-
-    const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
-    defer std.testing.allocator.free(spans);
-
-    try std.testing.expect(spans.len > 0);
-    try std.testing.expectEqual(
-        views.ViewStateKind.available,
-        engine.queryViewState("tokens").kind,
-    );
-    try std.testing.expectEqual(
-        views.ViewStateKind.available,
-        engine.queryViewState("syntax").kind,
-    );
-
-    var saw_keyword = false;
-    var saw_function = false;
-    var saw_punctuation = false;
-    for (spans) |span| {
-        if (std.mem.eql(u8, span.style, "syntax:keyword")) saw_keyword = true;
-        if (std.mem.eql(u8, span.style, "syntax:function")) saw_function = true;
-        if (std.mem.eql(u8, span.style, "syntax:punctuation")) saw_punctuation = true;
-    }
-    try std.testing.expect(saw_keyword or saw_function or saw_punctuation);
-}
-
 test "tree-sitter zig tokens attach and query" {
     var engine = try BufferEngine.initFromText(
         std.testing.allocator,
@@ -52,6 +17,11 @@ test "tree-sitter zig tokens attach and query" {
 
     try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "zig"));
     try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("tokens").kind);
+    try std.testing.expectError(
+        error.ViewStale,
+        engine.queryTokenSpans(0, engine.graphemeCount(), null),
+    );
+    _ = engine.refreshView("tokens", .unlimited);
 
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
@@ -86,6 +56,11 @@ test "tree-sitter lua tokens attach and query" {
 
     try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "lua"));
     try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("tokens").kind);
+    try std.testing.expectError(
+        error.ViewStale,
+        engine.queryTokenSpans(0, engine.graphemeCount(), null),
+    );
+    _ = engine.refreshView("tokens", .unlimited);
 
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
@@ -107,6 +82,7 @@ test "tree-sitter lua tokens refresh after mutation" {
     defer engine.deinit();
 
     try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "lua"));
+    _ = engine.refreshView("tokens", .unlimited);
     {
         const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
         defer std.testing.allocator.free(spans);
@@ -118,6 +94,10 @@ test "tree-sitter lua tokens refresh after mutation" {
     });
 
     try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("tokens").kind);
+    try std.testing.expectEqual(
+        views.ViewStateKind.available,
+        engine.refreshView("tokens", .unlimited).kind,
+    );
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
     try std.testing.expect(spans.len > 0);
@@ -134,6 +114,8 @@ test "tree-sitter lua syntax view resolves enclosing node and ref round trip" {
 
     try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "lua"));
     try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("syntax").kind);
+    try std.testing.expectError(error.ViewStale, engine.queryEnclosingSyntaxNode(0, null));
+    _ = engine.refreshView("syntax", .unlimited);
 
     const return_pos = try engine.lineColToPosition(1, 2);
     const node = (try engine.queryEnclosingSyntaxNode(
@@ -144,7 +126,7 @@ test "tree-sitter lua syntax view resolves enclosing node and ref round trip" {
     try std.testing.expect(node.is_named);
     try std.testing.expectEqualStrings("tree-sitter-lua", node.ref.provider);
     try std.testing.expectEqual(engine.revision, node.ref.revision);
-    try std.testing.expect(node.ref.path.len > 0);
+    try std.testing.expect(node.ref.id > 0);
 
     const again = try engine.querySyntaxNodeInfo(node.ref);
     try std.testing.expectEqualStrings(node.kind, again.kind);
@@ -162,6 +144,7 @@ test "tree-sitter syntax refs survive multiple queries at same revision" {
     defer engine.deinit();
 
     try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "lua"));
+    _ = engine.refreshView("syntax", .unlimited);
     const return_pos = try engine.lineColToPosition(1, 2);
     const first = (try engine.queryEnclosingSyntaxNode(return_pos, null)).?;
     const second_pos = try engine.lineColToPosition(0, 9);
@@ -184,11 +167,15 @@ test "tree-sitter syntax refs reject stale revisions" {
     defer engine.deinit();
 
     try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "lua"));
+    _ = engine.refreshView("syntax", .unlimited);
     const pos = try engine.lineColToPosition(0, 9);
     const node = (try engine.queryEnclosingSyntaxNode(pos, null)).?;
     try support.edit(&engine, &[_]buffer_types.BufferOp{
         .{ .insert = .{ .pos = engine.graphemeCount(), .text = "\n" } },
     });
+    try std.testing.expectError(error.InvalidArgument, engine.querySyntaxNodeInfo(node.ref));
+    // Refreshing makes the view current again, but not the old reference.
+    _ = engine.refreshView("syntax", .unlimited);
     try std.testing.expectError(error.InvalidArgument, engine.querySyntaxNodeInfo(node.ref));
 }
 
@@ -202,6 +189,8 @@ test "tree-sitter registers tokens and syntax as separate view facades" {
     try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("tokens").kind);
     try std.testing.expectEqual(views.ViewStateKind.stale, engine.queryViewState("syntax").kind);
 
+    // One shared parse: refreshing either facade makes both current.
+    _ = engine.refreshView("tokens", .unlimited);
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
     const pos = try engine.lineColToPosition(0, 0);
@@ -224,6 +213,7 @@ test "tree-sitter attachTokensBuiltin registers tokens only" {
     try std.testing.expect(engine.hasViewProvider("tokens"));
     try std.testing.expect(!engine.hasViewProvider("syntax"));
 
+    _ = engine.refreshView("tokens", .unlimited);
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
     try std.testing.expect(spans.len > 0);
@@ -238,6 +228,7 @@ test "tree-sitter attachSyntaxBuiltin registers syntax only" {
     try std.testing.expect(!engine.hasViewProvider("tokens"));
     try std.testing.expect(engine.hasViewProvider("syntax"));
 
+    _ = engine.refreshView("syntax", .unlimited);
     const pos = try engine.lineColToPosition(0, 9);
     const node = (try engine.queryEnclosingSyntaxNode(pos, null)).?;
     try std.testing.expectEqualStrings("tree-sitter-lua", node.ref.provider);
@@ -265,6 +256,7 @@ test "tree-sitter syntax facade can coexist with another tokens provider" {
     };
     try engine.registerViewProvider(static_provider.provider());
     try std.testing.expect(try TreeSitterTokenProvider.attachSyntaxBuiltin(&engine, "lua"));
+    _ = engine.refreshView("syntax", .unlimited);
 
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
@@ -283,4 +275,16 @@ test "tree-sitter lua unsupported language is ignored" {
     const spans = try engine.queryTokenSpans(0, engine.graphemeCount(), null);
     defer std.testing.allocator.free(spans);
     try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "tree-sitter enclosing node is null for text before the first token" {
+    // The root node starts at the first token; leading whitespace is inside no node.
+    var engine = try BufferEngine.initFromText(std.testing.allocator, "\n\n  local x = 1\n", null);
+    defer engine.deinit();
+    try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "lua"));
+    _ = engine.refreshView("syntax", .unlimited);
+    const leading = try engine.queryEnclosingSyntaxNode(0, null);
+    try std.testing.expectEqual(@as(?views.SyntaxNodeInfo, null), leading);
+    const inside = (try engine.queryEnclosingSyntaxNode(4, null)).?;
+    try std.testing.expect(inside.start <= 4 and inside.end > 4);
 }

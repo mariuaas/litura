@@ -15,6 +15,23 @@ pub fn changesText(block: *anyopaque) bool {
     };
 }
 
+/// How much work a refresh may do before returning (SPEC §2). A provider polls
+/// `exhausted` while it works; when it returns true, the provider stops, keeps its
+/// progress, and reports the view stale. A later refresh resumes, or starts over if the
+/// document changed meanwhile. The host decides how much work fits: a deadline, a
+/// step count, or anything else its callback measures. Litura owns no clock.
+pub const RefreshBudget = struct {
+    context: ?*anyopaque = null,
+    exhausted: ?*const fn (context: ?*anyopaque) bool = null,
+
+    pub const unlimited: RefreshBudget = .{};
+
+    pub fn isExhausted(self: RefreshBudget) bool {
+        const check = self.exhausted orelse return false;
+        return check(self.context);
+    }
+};
+
 pub const ViewStateKind = enum {
     available,
     absent,
@@ -62,12 +79,13 @@ pub const SemanticToken = struct {
     modifiers: []const []const u8,
 };
 
-/// Borrows provider identity and a provider-owned path at one document revision.
-/// For the Tree-sitter provider, refresh or destruction invalidates the path.
+/// A syntax node at one revision (SPEC §2.0.2): a plain value the provider can resolve
+/// while that revision is current. `id` is opaque; it needs no storage, so references
+/// can be kept and copied freely and never accumulate in the provider.
 pub const SyntaxNodeRef = struct {
     provider: []const u8,
     revision: u32,
-    path: []const u32,
+    id: u32,
 };
 
 pub const SyntaxNodeInfo = struct {
@@ -135,7 +153,7 @@ pub const ViewProvider = struct {
         views: []const []const u8,
         deinitFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
         stateForFn: *const fn (ptr: *anyopaque, view: []const u8, revision: u32) ViewState,
-        refreshFn: *const fn (ptr: *anyopaque, engine: *anyopaque) ViewState,
+        refreshFn: *const fn (ptr: *anyopaque, engine: *anyopaque, budget: RefreshBudget) ViewState,
         /// `block` points to a `*const events.Block`.
         onBufferEventFn: *const fn (ptr: *anyopaque, engine: *anyopaque, block: *anyopaque) void,
         tokenSpansFn: *const fn (
@@ -167,7 +185,7 @@ pub const ViewProvider = struct {
             engine: *anyopaque,
             position: u32,
             revision: u32,
-        ) ?SyntaxNodeInfo,
+        ) anyerror!?SyntaxNodeInfo,
         nodeInfoFn: *const fn (
             ptr: *anyopaque,
             engine: *anyopaque,
@@ -222,8 +240,11 @@ pub const ViewProvider = struct {
         return self.vtable.stateForFn(self.ptr, view, revision);
     }
 
-    pub fn refresh(self: ViewProvider, engine: *anyopaque) ViewState {
-        return self.vtable.refreshFn(self.ptr, engine);
+    /// Brings the provider's views to the engine's current revision, doing at most what
+    /// `budget` allows. Returns the resulting state; a view that is not yet current is
+    /// reported `stale` with the revision it last completed.
+    pub fn refresh(self: ViewProvider, engine: *anyopaque, budget: RefreshBudget) ViewState {
+        return self.vtable.refreshFn(self.ptr, engine, budget);
     }
 
     /// Hands the provider a published block, once per distinct provider, after the
@@ -252,7 +273,7 @@ pub const ViewProvider = struct {
         engine: *anyopaque,
         position: u32,
         revision: u32,
-    ) ?SyntaxNodeInfo {
+    ) !?SyntaxNodeInfo {
         return self.vtable.enclosingNodeFn(self.ptr, engine, position, revision);
     }
 
@@ -385,7 +406,7 @@ pub const StaticTokenProvider = struct {
         };
     }
 
-    fn refresh(ptr: *anyopaque, engine: *anyopaque) ViewState {
+    fn refresh(ptr: *anyopaque, engine: *anyopaque, _: RefreshBudget) ViewState {
         const self: *StaticTokenProvider = @ptrCast(@alignCast(ptr));
         const document: *const BufferEngine = @ptrCast(@alignCast(engine));
         // Only the revision the spans were written for can be served as available.
@@ -432,7 +453,7 @@ pub const StaticTokenProvider = struct {
         engine: *anyopaque,
         position: u32,
         revision: u32,
-    ) ?SyntaxNodeInfo {
+    ) !?SyntaxNodeInfo {
         _ = ptr;
         _ = engine;
         _ = position;

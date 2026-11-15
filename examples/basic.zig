@@ -52,6 +52,8 @@ pub fn main() !void {
         std.debug.assert(
             try litura.tree_sitter.TreeSitterTokenProvider.attachBuiltin(&document, "lua"),
         );
+        // Views are refreshed only on request; the host decides when, and how much work.
+        _ = document.refreshView("tokens", .unlimited);
         const spans = try document.queryTokenSpans(0, document.graphemeCount(), document.revision);
         defer allocator.free(spans);
     }

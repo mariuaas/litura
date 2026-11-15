@@ -1,6 +1,6 @@
 # Migrating to the interaction and event contract
 
-This release replaces how sessions, selections and results work. The changes are deliberate API breaks: every state change now goes through a declared request and is recorded in an owned block, and the shortcuts that changed state without one are gone. This note lists what a caller has to change. The contract itself is in the [specification](buffer-protocol/SPEC.md), §1.4, §2.6 and §7.
+This note lists what a caller has to change. Every state change now goes through a declared request and is recorded in an owned block. The contract itself is in the [specification](buffer-protocol/SPEC.md), §1.4, §2.6 and §7.
 
 ## Identities
 
@@ -73,9 +73,23 @@ Every other selection in the list must be repeated, usually with `.keep`, or it 
 
 `onBufferEvent` now receives a `*const events.Block`, borrowed for the call, once the whole transition or lifecycle request is published. Lifecycle and interaction-only blocks are delivered too; `views.changesText(block)` tells a text-derived view whether to go stale. Every state-changing entry point, including `createAnchor`, `createSession` and provider registration, returns `error.ReentrantMutation` from inside the callback.
 
+## Refreshing views
+
+Queries no longer refresh. Call `engine.refreshView(view, budget)` first. A query against a registered view that is not current fails with `error.ViewStale` or `error.ViewUnavailable` instead of returning empty results.
+
+`views.RefreshBudget.unlimited` refreshes to completion. A budget whose `exhausted` callback reports when to stop returns the view as `stale`; the next call resumes. Providers implement `refreshFn(ptr, engine, budget)`.
+
+## Syntax and splices
+
+`SyntaxNodeRef.path` is replaced by `id: u32`, a plain value with no lifetime beyond its revision. `enclosingNodeFn` returns `anyerror!?SyntaxNodeInfo`; `queryEnclosingSyntaxNode` reports provider errors instead of returning null, and returns null for text outside every node (for example whitespace before the first token), where it used to return the root.
+
+`RealizedSplice` gains byte offsets and `events.Point` fields for the same three boundaries. Code that builds splices must fill them in.
+
+The built-in Fennel grammar is removed; `attachBuiltin(engine, "fennel")` now returns false. Attach Fennel, or any other language, by compiling its generated parser and passing a `tree_sitter.Grammar` to `TreeSitterTokenProvider.attach`.
+
 ## Observing
 
-`engine.snapshot(allocator)` returns every session's state with `next_sequence`, the first block the snapshot does not reflect. An observer applies blocks from that number on. Edit events list session endpoints whose fate the splices do not determine; every other endpoint shifts by the splice rule, so an observer never needs the text to follow selections. Client anchors are not part of the stream.
+`engine.snapshot(allocator)` returns every session's state with `next_sequence`, the first block the snapshot does not reflect. An observer applies blocks from that number on. Edit events list session endpoints whose fate the splices do not determine; every other endpoint shifts by the splice rule. Client anchors are not part of the stream.
 
 ## Capabilities
 
