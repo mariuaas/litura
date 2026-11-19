@@ -65,6 +65,7 @@ test "engine reports registered view capabilities and states" {
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -74,6 +75,10 @@ test "engine reports registered view capabilities and states" {
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -128,6 +133,7 @@ test "engine reports registered view capabilities and states" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -212,6 +218,7 @@ test "registerViewProviders rejects conflicting batch during preflight" {
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -221,6 +228,10 @@ test "registerViewProviders rejects conflicting batch during preflight" {
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -275,6 +286,7 @@ test "registerViewProviders rejects conflicting batch during preflight" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -295,6 +307,7 @@ test "registerViewProviders rejects conflicting batch during preflight" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,

@@ -115,51 +115,70 @@ long lists edited only in ways that keep them valid, stale queries, resumption, 
 overtaken by an edit after every call, allocation-free node references, and allocation failure
 in token queries and while a parse is halted.
 
-The grammar-diversity suite (`-Dsyntax-corpus=true`, `tests/syntax_corpus_test.zig`) runs the
-same comparison over fourteen grammars pinned as test fixtures. Each grammar's own corpus and
-a hand-written sample, under random edits and halted refreshes, must match a fresh parse
-where that parse has no errors.
+The grammar-diversity suite (`-Dsyntax-corpus=true`, `tests/syntax_corpus_test.zig`) runs
+over fourteen grammars pinned as test fixtures: each grammar's own corpus and a hand-written
+sample, under random edits, refreshed both uninterrupted and in budgeted calls with edits
+arriving between them. Edits, the refresh schedule and the checks draw on separate random
+streams, and nothing in the schedule depends on parser outcomes, so a seed gives every
+Tree-sitter version the same edit trace; a hash of each grammar's trace confirms it. The
+suite separates two questions.
 
-The suite found that Tree-sitter's own incremental parse sometimes does not: after several
-precise edits, tree-sitter-ocaml's quoted strings came out as an `ERROR` that a fresh parse
-does not produce. An oracle runs beside the provider: raw Tree-sitter given one edit per
-committed block, derived from the texts alone. A difference from the fresh parse that the
-oracle reproduces exactly is Tree-sitter's; any other fails the test. Where the fresh parse
-has errors, recovery is history-dependent, so the suite checks coherence instead: the views
-describe the current revision, the tree spans the text, tokens are ordered and disjoint,
-windows agree with the whole document, and every node reference resolves to a node of the
-provider's tree with the reported kind and range.
+*Does Litura integrate Tree-sitter's incremental operations correctly?* Beside the provider
+runs a mirror: raw Tree-sitter driven through its API by the same operations, written from
+the protocol rather than from the provider. It gets the same splices, the same budgets
+counted in progress checks, a snapshot for a halted parse, and the splices of edits made
+while one is halted, applied when it completes. The provider's tree must equal the mirror's
+at every check, errors included, and after every refresh call both must have halted or
+finished at the same point.
 
-In ReleaseSafe with the default twelve steps per document, the suite exercised 2,490
-documents and 49,455 edit steps. Nine exact comparisons, all in OCaml documents with quoted
-strings, were Tree-sitter's divergences, each reproduced by the oracle; there were no others.
+*Does the Tree-sitter version provide structurally valid trees?* Every check walks the
+provider's tree through each node's children and compares the count with Tree-sitter's
+summaries, which node references rely on. A tree that fails is Tree-sitter's, since it
+equals the mirror's, and fails the run.
+
+Agreement with a fresh parse is then required where that parse has no errors, except that a
+difference the mirror shares is counted as Tree-sitter's: its incremental result depends on
+the edits and the interruptions it was given. The suite has seen such divergences on
+error-free text with OCaml quoted strings, Bash nested heredocs and C. Where the fresh parse
+has errors, the suite checks coherence: the views describe the current revision, tokens are
+ordered and disjoint, windows agree with the whole document, and every node reference,
+enclosing range and parent resolves, by an independent walk, to the provider's tree.
+
+On Tree-sitter v0.27.2, ten seed families in ReleaseSafe with twelve steps per document ran
+731,074 edit steps, 104,690 halted parses, 1.55 million enclosing-range queries and 2.46
+million parent steps: no integration mismatch, no inconsistent tree, and 106 divergences
+from a fresh parse, all shared by the mirror. On the development snapshot Litura was pinned
+to before, one JavaScript document produced an inconsistent tree after a resumed parse; raw
+Tree-sitter reproduces it from the captured operations, and later versions do not, but they
+halt at different points of the same sequence, so whether the defect was fixed is not
+known. See [known issues](../known-issues.md).
 
 ## Measurements
 
-Generated Lua, ReleaseFast, without any change to Tree-sitter, in microseconds. Typing 200
-characters mid-document, with refresh scheduled as a host's idle loop would run it, in calls
-with a 4 ms deadline each. *Submit* is what the editor waits for; *work* is the refresh
-calls together, how long highlighting lags; *longest* is the longest single call, the only
-part that can delay input in the host's loop.
+Generated Lua, ReleaseFast, on Tree-sitter v0.27.2, in microseconds. Typing 200 characters
+mid-document, with refresh scheduled as a host's idle loop would run it, in calls with a
+4 ms deadline each. *Submit* is what the editor waits for; *work* is the refresh calls
+together, how long highlighting lags; *longest* is the longest single call, the only part
+that can delay input in the host's loop.
 
 | Document | Submit p50 | Work p50 | Work max | Longest call | 60-line query p50 |
 | --- | --- | --- | --- | --- | --- |
-| 16 KiB | 7 | 303 | 1,383 | 1,383 | 593 |
-| 128 KiB | 11 | 1,737 | 4,474 | 4,295 | 601 |
-| 1 MiB | 13 | 12,935 | 35,316 | 5,477 | 618 |
-| 8 MiB | 20 | 124,663 | 291,550 | 25,768 | 646 |
+| 16 KiB | 7 | 325 | 826 | 826 | 659 |
+| 128 KiB | 10 | 1,801 | 4,478 | 4,292 | 655 |
+| 1 MiB | 13 | 12,994 | 35,764 | 5,268 | 650 |
+| 8 MiB | 20 | 146,168 | 307,950 | 28,637 | 702 |
 
 The worst cases, as total work and longest call:
 
 | Document | First parse | Four distant edits | Undo | Open `--[[` at the top | 1000 carets |
 | --- | --- | --- | --- | --- | --- |
-| 1 MiB | 364,636 / 5,259 | 24,862 / 4,496 | 18,119 / 4,842 | 431,554 / 32,353 | 96,588 / 4,432 |
-| 8 MiB | 2,950,942 / 25,888 | 206,248 / 15,114 | 166,014 / 13,590 | 3,448,064 / 254,217 | 363,661 / 21,456 |
+| 1 MiB | 368,981 / 5,662 | 23,684 / 5,189 | 18,416 / 4,235 | 418,435 / 22,694 | 101,113 / 4,445 |
+| 8 MiB | 2,945,282 / 19,213 | 227,553 / 15,667 | 186,839 / 17,807 | 3,380,381 / 183,872 | 379,987 / 16,040 |
 
 Against the baseline, an edit no longer blocks a query for the whole document's worth of work:
 at 1 MiB a keystroke's refresh fell from 902 ms, all of it inside the next query, to 13 ms
 of scheduled work in calls of at most about 5 ms, and the visible window highlights in
-0.6 ms. Large documents remain expensive in total, because of the per-item reparse above.
+0.65 ms. Large documents remain expensive in total, because of the per-item reparse above.
 Calls overrun their budget because Tree-sitter checks it only between tokens and every
 hundred or so operations; opening an unterminated block comment makes the rest of the file
 one token, which one call must lex. Remaining costs and limits are listed in

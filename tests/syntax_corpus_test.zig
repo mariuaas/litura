@@ -1,29 +1,44 @@
-//! Syntax views agree with recomputation across a corpus of substantially different
-//! grammars: test-only fixtures pinned in `build.zig.zon` (`-Dsyntax-corpus=true`).
+//! Syntax views across a corpus of substantially different grammars: test-only fixtures
+//! pinned in `build.zig.zon` (`-Dsyntax-corpus=true`). The suite answers two questions
+//! separately: does Litura integrate Tree-sitter's incremental operations correctly, and
+//! does the Tree-sitter version provide structurally valid trees?
 //!
 //! Method: every example of each grammar's own test corpus, and a larger hand-written
 //! sample, goes through seeded random editing: copies of the document's own text,
 //! deletions, replacements, Unicode fragments that resegment graphemes, multi-operation
 //! transactions, multi-cursor composites, undo and redo. Views are refreshed either
-//! uninterrupted or under budgets that halt parses, with edits arriving while a parse is
-//! halted. After every refresh the views are compared with a fresh engine parsing the
-//! same text: exactly when that text parses without errors, and otherwise for coherence,
-//! because Tree-sitter's error recovery depends on the trees it reuses and on where a
-//! halted parse resumed. Finally every edit is undone, and the original text must parse
-//! as it did. Seeds are fixed; a failure names the grammar, document and seed.
+//! uninterrupted or under budgets that halt parses, with edits arriving between refresh
+//! calls. Edits, the refresh schedule and the checks draw on separate random streams,
+//! and nothing in the schedule depends on parser outcomes, so a seed
+//! (`-Dsyntax-corpus-seed`) gives every Tree-sitter version the same edit trace; each
+//! grammar's line reports a hash of its trace to confirm it.
 //!
-//! Tree-sitter's incremental parse can itself differ from a fresh parse of error-free
-//! text after several edits (observed with tree-sitter-ocaml's quoted strings). So beside
-//! the provider runs an oracle: a raw Tree-sitter tree given one edit per committed block,
-//! derived independently from the texts before and after, and reparsed whenever the
-//! provider's views become current. A difference from the fresh parse that the oracle
-//! reproduces exactly is Tree-sitter's, and is counted and reported; any other is a
-//! failure.
+//! Integration: beside the provider runs a mirror, raw Tree-sitter driven through its API
+//! by the same operations: the same splices, the same budgets in progress checks, a
+//! snapshot for a halted parse, and splices queued while one is halted. The provider's
+//! tree must equal the mirror's at every check, errors included, and after every refresh
+//! call both must have halted or finished at the same point. A difference is
+//! `error.IntegrationMismatch`, a Litura defect.
+//!
+//! Integrity: every check then walks the provider's tree (`syntax_oracle.zig`). A tree
+//! whose children cannot be traversed as its summaries describe is identical to the
+//! mirror's, so Tree-sitter produced it: `error.UpstreamInconsistentTree`, which fails
+//! the run, because node references depend on those summaries whoever is at fault.
+//!
+//! Agreement: views are compared with a fresh engine parsing the same text, exactly when
+//! that text parses without errors. Tree-sitter's incremental parse can differ from a
+//! fresh one, depending on the edits and the interruptions it was given (observed with
+//! OCaml quoted strings, Bash nested heredocs and C); since the provider's tree equals the
+//! mirror's, such differences are Tree-sitter's and are counted, not failed. Otherwise
+//! the views must be coherent with the provider's tree. Finally every edit is undone, and
+//! the original text must parse as it did. A failure names the grammar, document and
+//! seed; a failing grammar stops at its first failure, and the others still run.
 const std = @import("std");
 const litura = @import("litura");
 const corpus = @import("syntax_corpus");
 const options = @import("syntax_corpus_options");
 const support = @import("support.zig");
+const structure = @import("syntax_oracle.zig");
 const BufferEngine = litura.BufferEngine;
 const TreeSitter = litura.tree_sitter.TreeSitterTokenProvider;
 const Grammar = litura.tree_sitter.Grammar;
@@ -31,7 +46,7 @@ const views = litura.views;
 const types = litura.types;
 const allocator = std.testing.allocator;
 
-const base_seed: u64 = 0x5eed_c0de;
+const base_seed: u64 = options.seed;
 
 /// Halts a refresh after a fixed number of progress checks.
 const StepBudget = struct {
@@ -43,6 +58,16 @@ const StepBudget = struct {
 
     fn exhausted(context: ?*anyopaque) bool {
         const self: *StepBudget = @ptrCast(@alignCast(context.?));
+        return self.poll();
+    }
+
+    fn haltParse(context: *anyopaque) bool {
+        const self: *StepBudget = @ptrCast(@alignCast(context));
+        return self.poll();
+    }
+
+    /// One progress check: true once the budget is spent.
+    fn poll(self: *StepBudget) bool {
         if (self.remaining == 0) return true;
         self.remaining -= 1;
         return false;
@@ -59,10 +84,22 @@ const Stats = struct {
     clean_originals: usize = 0,
     /// Exact comparisons where Tree-sitter's own incremental parse differed from fresh.
     upstream_divergences: usize = 0,
+    /// Enclosing-range queries, and parent steps from their answers to the root.
+    range_queries: usize = 0,
+    parent_steps: usize = 0,
+    /// Parent steps to a node with the same range as its child.
+    same_range_parents: usize = 0,
+    /// Every committed text in order, hashed: equal across Tree-sitter versions exactly
+    /// when the edit traces are.
+    trace: u64 = 0,
 
     fn add(self: *Stats, other: Stats) void {
         inline for (std.meta.fields(Stats)) |field| {
-            @field(self, field.name) += @field(other, field.name);
+            if (comptime std.mem.eql(u8, field.name, "trace")) {
+                self.trace = std.hash.Wyhash.hash(self.trace, std.mem.asBytes(&other.trace));
+            } else {
+                @field(self, field.name) += @field(other, field.name);
+            }
         }
     }
 };
@@ -70,66 +107,111 @@ const Stats = struct {
 const RawParser = @FieldType(TreeSitter, "parser");
 const RawTree = @typeInfo(@FieldType(TreeSitter, "tree")).optional.child;
 
-/// Tree-sitter driven directly, without Litura: one edit per committed block, derived
-/// from the text before and after it, and a reparse when the provider's views catch up.
-const Oracle = struct {
-    parser: RawParser,
-    tree: RawTree,
-    text: []u8,
+const RawParseInput = @typeInfo(@TypeOf(RawParser.parseInput)).@"fn".params;
+const RawInput = RawParseInput[2].type.?;
+const RawProgress = @typeInfo(RawParseInput[3].type.?).optional.child;
 
-    fn init(grammar: *const Grammar, text: []const u8) !Oracle {
+/// Raw Tree-sitter driven through its API by the operations of an incremental, budgeted
+/// refresh, written from the protocol rather than from the provider:
+///
+/// - a block's splices edit the last completed tree, or are queued while a parse is
+///   halted;
+/// - a parse reads the current text; a halted parse resumes on the text it started with;
+/// - the budget is consulted by Tree-sitter's progress callback, and once before each
+///   further parse in the same refresh;
+/// - when a halted parse completes, its tree takes the queued splices, and the refresh
+///   goes on parsing toward the current text.
+///
+/// Given the same edits and the same budgets as the provider, Tree-sitter receives the
+/// same operations, so the trees must be identical, errors included. Interruption points
+/// are counts of progress checks, never time, so they are deterministic.
+const Mirror = struct {
+    parser: RawParser,
+    /// The last completed parse.
+    tree: ?RawTree = null,
+    /// The document's current text, owned.
+    text: []u8,
+    /// Whether `tree` describes `text`.
+    current: bool = false,
+    /// The text a halted parse reads, owned; null when no parse is halted.
+    halted: ?[]u8 = null,
+    queued: std.ArrayListUnmanaged(litura.events.RealizedSplice) = .empty,
+
+    fn init(grammar: *const Grammar, text: []const u8) !Mirror {
         var parser = try RawParser.create();
         errdefer parser.destroy();
         try parser.setLanguage(grammar.language());
-        const owned = try allocator.dupe(u8, text);
-        errdefer allocator.free(owned);
-        return .{ .parser = parser, .tree = try parser.parseString(owned, null), .text = owned };
+        return .{ .parser = parser, .text = try allocator.dupe(u8, text) };
     }
 
-    fn deinit(self: *Oracle) void {
-        self.tree.destroy();
+    fn deinit(self: *Mirror) void {
+        if (self.tree) |*tree| tree.destroy();
         self.parser.destroy();
         allocator.free(self.text);
+        if (self.halted) |snapshot| allocator.free(snapshot);
+        self.queued.deinit(allocator);
     }
 
-    /// Records the change from the last text to `now`, taking ownership of it, as one
-    /// edit covering every byte that differs.
-    fn record(self: *Oracle, now: []u8) void {
-        const old = self.text;
-        var prefix: usize = 0;
-        while (prefix < old.len and prefix < now.len and old[prefix] == now[prefix]) prefix += 1;
-        var suffix: usize = 0;
-        while (suffix < old.len - prefix and suffix < now.len - prefix and
-            old[old.len - 1 - suffix] == now[now.len - 1 - suffix]) suffix += 1;
-        const start = pointOf(old, prefix);
-        const old_end = pointOf(old, old.len - suffix);
-        const new_end = pointOf(now, now.len - suffix);
-        self.tree.edit(.{
-            .start_byte = @intCast(prefix),
-            .old_end_byte = @intCast(old.len - suffix),
-            .new_end_byte = @intCast(now.len - suffix),
-            .start_point = .{ .row = start.row, .column = start.column },
-            .old_end_point = .{ .row = old_end.row, .column = old_end.column },
-            .new_end_point = .{ .row = new_end.row, .column = new_end.column },
-        });
-        allocator.free(old);
+    /// A committed block's splices, and the text after them, which it takes.
+    fn edit(self: *Mirror, splices: []const litura.events.RealizedSplice, now: []u8) !void {
+        allocator.free(self.text);
         self.text = now;
+        if (splices.len == 0) return;
+        self.current = false;
+        if (self.halted != null) {
+            try self.queued.appendSlice(allocator, splices);
+        } else if (self.tree) |tree| {
+            for (splices) |splice| applySplice(tree, splice);
+        }
     }
 
-    fn reparse(self: *Oracle) !void {
-        const next = try self.parser.parseString(self.text, self.tree);
-        self.tree.destroy();
-        self.tree = next;
+    fn refresh(self: *Mirror, budget: ?*StepBudget) !void {
+        var first = true;
+        while (!self.current) : (first = false) {
+            if (!first) if (budget) |steps| if (steps.poll()) break;
+            var reader = Reader{ .text = self.halted orelse self.text };
+            const input = RawInput{ .context = @ptrCast(&reader), .read = Reader.read };
+            const progress: ?RawProgress = if (budget) |steps|
+                .{ .context = @ptrCast(steps), .halt = StepBudget.haltParse }
+            else
+                null;
+            const tree = try self.parser.parseInput(self.tree, input, progress) orelse {
+                if (self.halted == null) self.halted = try allocator.dupe(u8, self.text);
+                break;
+            };
+            if (self.tree) |*old| old.destroy();
+            self.tree = tree;
+            if (self.halted) |snapshot| {
+                allocator.free(snapshot);
+                self.halted = null;
+                for (self.queued.items) |splice| applySplice(tree, splice);
+                self.current = self.queued.items.len == 0;
+                self.queued.clearRetainingCapacity();
+            } else {
+                self.current = true;
+            }
+        }
     }
 
-    fn pointOf(text: []const u8, byte: usize) struct { row: u32, column: u32 } {
-        const prefix = text[0..byte];
-        const line_start = if (std.mem.lastIndexOfScalar(u8, prefix, '\n')) |last| last + 1 else 0;
-        return .{
-            .row = @intCast(std.mem.count(u8, prefix, "\n")),
-            .column = @intCast(byte - line_start),
-        };
+    fn applySplice(tree: RawTree, splice: litura.events.RealizedSplice) void {
+        tree.edit(.{
+            .start_byte = splice.start_byte,
+            .old_end_byte = splice.old_end_byte,
+            .new_end_byte = splice.new_end_byte,
+            .start_point = .{ .row = splice.start_point.row, .column = splice.start_point.column },
+            .old_end_point = .{ .row = splice.old_end_point.row, .column = splice.old_end_point.column },
+            .new_end_point = .{ .row = splice.new_end_point.row, .column = splice.new_end_point.column },
+        });
     }
+
+    const Reader = struct {
+        text: []const u8,
+
+        fn read(context: *const anyopaque, byte: u32) []const u8 {
+            const self: *const Reader = @ptrCast(@alignCast(context));
+            return if (byte >= self.text.len) "" else self.text[byte..];
+        }
+    };
 };
 
 fn provider(engine: *BufferEngine) *TreeSitter {
@@ -154,15 +236,18 @@ const Outcome = enum {
     with_errors,
 };
 
-/// Checks the views of `engine` against a fresh parse of its text. Exact when that parse
-/// has no errors, unless `oracle` shows Tree-sitter's own incremental parse differs the
-/// same way (counted in `stats`); otherwise checks that the views are coherent with the
-/// provider's own tree.
+/// Checks the views of `engine`. First the integration contract: the provider's tree is
+/// identical to `mirror`'s, raw Tree-sitter given the same operations (else
+/// error.IntegrationMismatch). Then the tree's integrity: a tree whose children cannot be
+/// traversed as its summaries describe is Tree-sitter's output, so it fails with
+/// error.UpstreamInconsistentTree. Then a fresh parse of the same text: exact when that
+/// parse has no errors, with differences that the identical mirror shares counted as
+/// Tree-sitter's divergences in `stats`; otherwise coherence with the provider's tree.
 fn check(
     engine: *BufferEngine,
     grammar: *const Grammar,
     random: std.Random,
-    oracle: *Oracle,
+    mirror: *Mirror,
     stats: *Stats,
 ) !Outcome {
     const text = try engine.getText();
@@ -175,6 +260,36 @@ fn check(
     try std.testing.expectEqual(@as(?u32, engine.revision), state.revision);
     const root = provider(engine).tree.?.rootNode();
     try std.testing.expectEqual(@as(u32, @intCast(text.len)), root.endByte());
+    {
+        try std.testing.expect(mirror.current);
+        const incremental = try root.toSexp(allocator);
+        defer allocator.free(incremental);
+        const raw = try mirror.tree.?.rootNode().toSexp(allocator);
+        defer allocator.free(raw);
+        if (!std.mem.eql(u8, raw, incremental)) {
+            std.debug.print("{s}: integration mismatch; text {f}\nmirror   {s}\nprovider {s}\n", .{
+                grammar.name, std.zig.fmtString(text), raw, incremental,
+            });
+            return error.IntegrationMismatch;
+        }
+    }
+    var table = structure.Table.init(allocator, root) catch |err| {
+        if (err != error.InconsistentTree) return err;
+        // The mirror's tree is identical; is it inconsistent the same way?
+        var mirror_table = structure.Table.init(allocator, mirror.tree.?.rootNode()) catch |mirror_err| {
+            if (mirror_err != error.InconsistentTree) return mirror_err;
+            std.debug.print("{s}: Tree-sitter produced an inconsistent tree; text {f}\n", .{
+                grammar.name, std.zig.fmtString(text),
+            });
+            return error.UpstreamInconsistentTree;
+        };
+        mirror_table.deinit(allocator);
+        std.debug.print("{s}: identical trees, but only the provider's is inconsistent\n", .{
+            grammar.name,
+        });
+        return error.IntegrationMismatch;
+    };
+    defer table.deinit(allocator);
 
     var reference = try BufferEngine.initFromText(allocator, text, null);
     defer reference.deinit();
@@ -190,10 +305,7 @@ fn check(
         const fresh = try reference_root.toSexp(allocator);
         defer allocator.free(fresh);
         if (!std.mem.eql(u8, fresh, incremental)) {
-            const raw = try oracle.tree.rootNode().toSexp(allocator);
-            defer allocator.free(raw);
-            // Not reproduced by Tree-sitter alone: the difference is Litura's.
-            try std.testing.expectEqualStrings(raw, incremental);
+            // The mirror's tree is identical (checked above): Tree-sitter's divergence.
             stats.upstream_divergences += 1;
             std.debug.print(
                 "upstream divergence in {s}: text {f}\n",
@@ -238,15 +350,14 @@ fn check(
         const node = (try engine.queryEnclosingSyntaxNode(position, null)) orelse continue;
         // The reference resolves to a node of the provider's tree with the same kind and
         // range, and that node contains the grapheme.
-        var remaining = node.ref.id;
-        const resolved = preorderNode(root, &remaining).?;
-        try std.testing.expectEqualStrings(resolved.type(), node.kind);
+        try std.testing.expect(node.ref.id < table.kind.len);
+        try std.testing.expectEqualStrings(table.kind[node.ref.id], node.kind);
         try std.testing.expectEqual(
-            try engine.table.positionAtByte(resolved.startByte(), .down),
+            try engine.table.positionAtByte(table.start[node.ref.id], .down),
             node.start,
         );
         try std.testing.expectEqual(
-            try engine.table.positionAtByte(resolved.endByte(), .up),
+            try engine.table.positionAtByte(table.end[node.ref.id], .up),
             node.end,
         );
         try std.testing.expect(node.start <= position);
@@ -262,32 +373,61 @@ fn check(
             try std.testing.expectEqual(fresh.ref.id, node.ref.id);
         }
     }
+    // Structure: the smallest node around random ranges, and its ancestry to the root,
+    // against the independent walk of the provider's tree.
+    for (0..3) |_| {
+        if (count == 0) break;
+        const start = random.uintLessThan(u32, count);
+        const rest = count - start - 1;
+        const longest = if (random.uintLessThan(u8, 4) == 0) rest else @min(rest, 40);
+        const end = start + 1 + random.uintAtMost(u32, longest);
+        const node = try engine.queryEnclosingSyntaxNodeRange(start, end, null);
+        const start_byte = try engine.table.byteOffset(start);
+        const end_byte = try engine.table.byteOffset(end);
+        const id: ?u32 = if (node) |found| found.ref.id else null;
+        try std.testing.expectEqual(table.enclosing(start_byte, end_byte), id);
+        stats.range_queries += 1;
+        if (exact) {
+            const fresh = try reference.queryEnclosingSyntaxNodeRange(start, end, null);
+            try std.testing.expectEqual(if (fresh) |found| found.ref.id else null, id);
+        }
+
+        var current = node orelse continue;
+        while (try engine.querySyntaxNodeParent(current.ref)) |parent| {
+            try std.testing.expectEqual(table.parent[current.ref.id], parent.ref.id);
+            const parent_start = try engine.table.positionAtByte(table.start[parent.ref.id], .down);
+            const parent_end = try engine.table.positionAtByte(table.end[parent.ref.id], .up);
+            try std.testing.expectEqual(parent_start, parent.start);
+            try std.testing.expectEqual(parent_end, parent.end);
+            try std.testing.expectEqual(table.named[parent.ref.id], parent.is_named);
+            try std.testing.expect(parent.start <= current.start and parent.end >= current.end);
+            stats.parent_steps += 1;
+            const same_range = parent.start == current.start and parent.end == current.end;
+            stats.same_range_parents += @intFromBool(same_range);
+            current = parent;
+        }
+        try std.testing.expectEqual(@as(?u32, null), table.parent[current.ref.id]);
+    }
     if (diverged) return .upstream_divergence;
     return if (exact) .exact else .with_errors;
-}
-
-/// The node `remaining.*` steps into a preorder walk of visible nodes from `node`: the
-/// meaning of a node reference's id, computed independently of the provider.
-fn preorderNode(node: anytype, remaining: *u32) ?@TypeOf(node) {
-    if (remaining.* == 0) return node;
-    remaining.* -= 1;
-    var index: u32 = 0;
-    while (index < node.childCount()) : (index += 1) {
-        if (preorderNode(node.child(index), remaining)) |found| return found;
-    }
-    return null;
 }
 
 const unicode_fragments = [_][]const u8{
     "e\u{0301}", "\u{0301}", "\r\n", "\n", "\t", "\u{1f44d}\u{1f3fd}", "\u{1f1f3}\u{1f1f4}", "\u{00e9}",
 };
 
+/// Edits a document and refreshes its views on a schedule fixed in advance. Edits draw
+/// only on `edits` and the document's text, which depends only on the edits; refresh
+/// calls, their budgets and the edits between them draw only on `schedule`. Neither
+/// depends on parser outcomes or on the checks, so a seed gives every Tree-sitter version
+/// the same edit trace.
 const Workload = struct {
     engine: *BufferEngine,
-    random: std.Random,
+    edits: std.Random,
+    schedule: std.Random,
     budgeted: bool,
     stats: *Stats,
-    oracle: *Oracle,
+    mirror: *Mirror,
     /// Whether edits may arrive while a parse is halted. Off around the original text,
     /// which the run compares before editing and after undoing every edit.
     interleave: bool = false,
@@ -299,8 +439,17 @@ const Workload = struct {
         var result = try self.engine.submit(
             .{ .id = support.id, .origin = self.engine.revision, .payload = payload },
         );
-        result.deinit(allocator);
-        self.oracle.record(try self.engine.getText());
+        defer result.deinit(allocator);
+        const splices: []const litura.events.RealizedSplice = switch (result) {
+            .committed => |block| switch (block) {
+                .transition => |transition| if (transition.edit) |edit| edit.splices else &.{},
+                .lifecycle => &.{},
+            },
+            .rejected => &.{},
+        };
+        const now = try self.engine.getText();
+        self.stats.trace = std.hash.Wyhash.hash(self.stats.trace, now);
+        try self.mirror.edit(splices, now);
         // An edit makes the views stale, and stale views are never served.
         if (self.engine.queryViewState("syntax").kind == .stale) {
             try std.testing.expectError(error.ViewStale, self.engine.queryTokenSpans(0, 0, null));
@@ -310,14 +459,14 @@ const Workload = struct {
     /// A random range of up to `limit` graphemes inside the text.
     fn range(self: *Workload, limit: u32) struct { u32, u32 } {
         const count = self.engine.graphemeCount();
-        const start = self.random.uintAtMost(u32, count);
-        return .{ start, start + self.random.uintAtMost(u32, @min(limit, count - start)) };
+        const start = self.edits.uintAtMost(u32, count);
+        return .{ start, start + self.edits.uintAtMost(u32, @min(limit, count - start)) };
     }
 
     /// Text to insert: a copy of part of the document, or a Unicode fragment.
     fn fragment(self: *Workload, storage: *std.ArrayListUnmanaged(u8)) ![]const u8 {
-        if (self.random.uintLessThan(u8, 3) == 0) {
-            return unicode_fragments[self.random.uintLessThan(usize, unicode_fragments.len)];
+        if (self.edits.uintLessThan(u8, 3) == 0) {
+            return unicode_fragments[self.edits.uintLessThan(usize, unicode_fragments.len)];
         }
         const start, const end = self.range(16);
         const text = try self.engine.getTextRange(start, end);
@@ -334,7 +483,7 @@ const Workload = struct {
         const text = try self.engine.getText();
         defer allocator.free(text);
         if (text.len < 2) return null;
-        const from = self.random.uintLessThan(usize, text.len);
+        const from = self.edits.uintLessThan(usize, text.len);
         for (0..text.len) |offset| {
             const index = (from + offset) % text.len;
             if (index == 0 or text[index] != ' ') continue;
@@ -351,13 +500,13 @@ const Workload = struct {
         var ops: [4]types.BufferOp = undefined;
         self.stats.steps += 1;
         const choice = if (self.neutral_only)
-            ([_]u8{ 10, 10, 11, 11, 6, 7 })[self.random.uintLessThan(usize, 6)]
+            ([_]u8{ 10, 10, 11, 11, 6, 7 })[self.edits.uintLessThan(usize, 6)]
         else
-            self.random.uintLessThan(u8, 13);
+            self.edits.uintLessThan(u8, 13);
         switch (choice) {
             0, 1, 2 => {
                 const start, const end = self.range(8);
-                ops[0] = if (self.random.boolean())
+                ops[0] = if (self.edits.boolean())
                     .{
                         .replace = .{
                             .start = start,
@@ -376,10 +525,10 @@ const Workload = struct {
             },
             3, 4 => {
                 // Distant inserts in one transaction; descending positions stay valid.
-                const count = 2 + self.random.uintLessThan(usize, 3);
+                const count = 2 + self.edits.uintLessThan(usize, 3);
                 var limit = self.engine.graphemeCount();
                 for (ops[0..count], storage[0..count]) |*op, *buffer| {
-                    const at = self.random.uintAtMost(u32, limit);
+                    const at = self.edits.uintAtMost(u32, limit);
                     op.* = .{ .insert = .{ .pos = at, .text = try self.fragment(buffer) } };
                     limit = at;
                 }
@@ -392,7 +541,7 @@ const Workload = struct {
                     self.engine.graphemeCount() / 2,
                 );
                 defer support.dropSession(self.engine, session) catch {};
-                const at = self.random.uintAtMost(u32, self.engine.graphemeCount());
+                const at = self.edits.uintAtMost(u32, self.engine.graphemeCount());
                 const first = try self.fragment(&storage[0]);
                 const second = try self.fragment(&storage[1]);
                 try self.submit(.{ .composite = .{ .parts = &.{
@@ -418,7 +567,7 @@ const Workload = struct {
             10, 11 => {
                 // Edits that usually keep the program valid, alone or several in one
                 // transaction at descending positions.
-                const count: usize = if (self.random.boolean()) 1 else 2 + self.random.uintLessThan(
+                const count: usize = if (self.edits.boolean()) 1 else 2 + self.edits.uintLessThan(
                     usize,
                     3,
                 );
@@ -443,27 +592,36 @@ const Workload = struct {
         }
     }
 
-    /// Refreshes until current. Under a budget, parses halt and edits sometimes arrive
-    /// while one is halted, as when typing; they stop after a while, as when it pauses.
+    /// Brings the views up to date. Under a budget: a scheduled number of refresh calls,
+    /// each with a scheduled budget in progress checks, and scheduled edits between them,
+    /// which arrive while a parse is halted whenever one is, as when typing. Then, as when
+    /// typing pauses, an unlimited refresh finishes the work. After every call the
+    /// provider and the mirror have both halted or both finished, at the same point.
     fn refresh(self: *Workload) !void {
-        if (!self.budgeted) {
-            const state = self.engine.refreshView("syntax", .unlimited);
-            try std.testing.expectEqual(views.ViewStateKind.available, state.kind);
-            return self.oracle.reparse();
+        if (self.budgeted) {
+            const calls = 1 + self.schedule.uintLessThan(u32, 8);
+            for (0..calls) |_| {
+                const steps = self.schedule.uintAtMost(u32, 6);
+                const edit_after = self.interleave and self.schedule.uintLessThan(u8, 4) == 0;
+                var budget = StepBudget{ .remaining = steps };
+                const state = self.engine.refreshView("syntax", budget.budget());
+                var mirror_budget = StepBudget{ .remaining = steps };
+                try self.mirror.refresh(&mirror_budget);
+                try std.testing.expectEqual(state.kind == .available, self.mirror.current);
+                try std.testing.expectEqual(budget.remaining, mirror_budget.remaining);
+                if (state.kind != .available) {
+                    try std.testing.expectEqual(views.ViewStateKind.stale, state.kind);
+                    const stale = self.engine.queryTokenSpans(0, 0, null);
+                    try std.testing.expectError(error.ViewStale, stale);
+                    self.stats.halts += 1;
+                }
+                if (edit_after) try self.step();
+            }
         }
-        for (0..100_000) |call| {
-            var budget = StepBudget{ .remaining = self.random.uintAtMost(u32, 6) };
-            const state = self.engine.refreshView("syntax", budget.budget());
-            if (state.kind == .available) return self.oracle.reparse();
-            try std.testing.expectEqual(views.ViewStateKind.stale, state.kind);
-            try std.testing.expectError(error.ViewStale, self.engine.queryTokenSpans(0, 0, null));
-            self.stats.halts += 1;
-            if (self.interleave and call < 20 and self.random.uintLessThan(
-                u8,
-                4,
-            ) == 0) try self.step();
-        }
-        return error.RefreshNeverCompleted;
+        const state = self.engine.refreshView("syntax", .unlimited);
+        try std.testing.expectEqual(views.ViewStateKind.available, state.kind);
+        try self.mirror.refresh(null);
+        try std.testing.expect(self.mirror.current);
     }
 };
 
@@ -479,27 +637,32 @@ fn runDocument(
         var engine = try BufferEngine.initFromText(allocator, text, null);
         defer engine.deinit();
         try std.testing.expect(try TreeSitter.attach(&engine, grammar));
-        var prng = std.Random.DefaultPrng.init(seed);
-        var oracle = try Oracle.init(grammar, text);
-        defer oracle.deinit();
+        // Three independent streams: edits, the refresh schedule, and the checks' queries.
+        var edit_prng = std.Random.DefaultPrng.init(seed);
+        var schedule_prng = std.Random.DefaultPrng.init(seed ^ 0x5c4e_d01e);
+        var query_prng = std.Random.DefaultPrng.init(seed ^ 0x9e37_79b9);
+        const queries = query_prng.random();
+        var mirror = try Mirror.init(grammar, text);
+        defer mirror.deinit();
         var workload = Workload{
             .engine = &engine,
-            .random = prng.random(),
+            .edits = edit_prng.random(),
+            .schedule = schedule_prng.random(),
             .budgeted = budgeted,
             .stats = stats,
-            .oracle = &oracle,
+            .mirror = &mirror,
         };
         stats.documents += 1;
 
         try workload.refresh();
-        const original = try check(&engine, grammar, workload.random, &oracle, stats);
+        const original = try check(&engine, grammar, queries, &mirror, stats);
         const clean = original != .with_errors;
         stats.clean_originals += @intFromBool(clean);
         workload.interleave = true;
         for (0..steps) |_| {
             try workload.step();
             try workload.refresh();
-            switch (try check(&engine, grammar, workload.random, &oracle, stats)) {
+            switch (try check(&engine, grammar, queries, &mirror, stats)) {
                 .exact => stats.exact += 1,
                 .with_errors => stats.with_errors += 1,
                 .upstream_divergence => {},
@@ -511,7 +674,7 @@ fn runDocument(
         while (engine.undo_stack.items.len > 0) try workload.submit(.{ .undo = .{} });
         try workload.refresh();
         try support.expectText(&engine, text);
-        const restored = try check(&engine, grammar, workload.random, &oracle, stats);
+        const restored = try check(&engine, grammar, queries, &mirror, stats);
         try std.testing.expectEqual(clean, restored != .with_errors);
 
         // Edits that keep the program valid, so that the comparisons are exact: spaces
@@ -521,7 +684,7 @@ fn runDocument(
         for (0..steps / 2) |_| {
             try workload.step();
             try workload.refresh();
-            switch (try check(&engine, grammar, workload.random, &oracle, stats)) {
+            switch (try check(&engine, grammar, queries, &mirror, stats)) {
                 .exact => stats.exact += 1,
                 .with_errors => stats.with_errors += 1,
                 .upstream_divergence => {},
@@ -600,8 +763,12 @@ fn hasClosingRule(lines: []const []const u8, index: usize) bool {
 }
 
 test "syntax views agree with full reparsing across the grammar corpus" {
+    // A failing grammar stops at its first failure, which is printed; the others still
+    // run, so one failure does not hide the state of the rest.
     var total: Stats = .{};
-    for (&corpus.entries, 0..) |*entry, grammar_index| {
+    var failed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer failed.deinit(allocator);
+    grammars: for (&corpus.entries, 0..) |*entry, grammar_index| {
         var stats: Stats = .{};
         var examples: std.ArrayListUnmanaged([]const u8) = .empty;
         defer examples.deinit(allocator);
@@ -614,7 +781,9 @@ test "syntax views agree with full reparsing across the grammar corpus" {
                     "\n{s} corpus example {d}, seed 0x{x}:\n{s}\n",
                     .{ entry.name, example_index, seed, example },
                 );
-                return err;
+                std.debug.print("corpus {s} FAILED: {t}\n", .{ entry.name, err });
+                try failed.append(allocator, entry.name);
+                continue :grammars;
             };
         }
         // The hand-written sample, alone and repeated into a long document.
@@ -628,7 +797,9 @@ test "syntax views agree with full reparsing across the grammar corpus" {
                     "\n{s} sample {d}, seed 0x{x}\n",
                     .{ entry.name, sample_index, seed },
                 );
-                return err;
+                std.debug.print("corpus {s} FAILED: {t}\n", .{ entry.name, err });
+                try failed.append(allocator, entry.name);
+                continue :grammars;
             };
         }
         std.debug.print("corpus {s:<11} {s:<17} examples {d:>4}  ", .{
@@ -637,14 +808,18 @@ test "syntax views agree with full reparsing across the grammar corpus" {
         std.debug.print("documents {d:>4}  steps {d:>6}  exact {d:>6}  with errors {d:>5}  ", .{
             stats.documents, stats.steps, stats.exact, stats.with_errors,
         });
-        std.debug.print("halts {d:>6}  clean originals {d:>4}  upstream divergences {d}\n", .{
+        std.debug.print("halts {d:>6}  clean originals {d:>4}  upstream divergences {d}  ", .{
             stats.halts, stats.clean_originals, stats.upstream_divergences,
         });
+        std.debug.print("range queries {d:>5}  parent steps {d:>6}  same-range parents {d:>5}  ", .{
+            stats.range_queries, stats.parent_steps, stats.same_range_parents,
+        });
+        std.debug.print("trace {x:0>16}\n", .{stats.trace});
         total.add(stats);
     }
     std.debug.print(
         "corpus total: {d} documents, {d} steps, {d} exact, {d} with errors, {d} halts, " ++
-            "{d} upstream divergences\n",
+            "{d} upstream divergences, {d} range queries, {d} parent steps ({d} same-range)\n",
         .{
             total.documents,
             total.steps,
@@ -652,8 +827,13 @@ test "syntax views agree with full reparsing across the grammar corpus" {
             total.with_errors,
             total.halts,
             total.upstream_divergences,
+            total.range_queries,
+            total.parent_steps,
+            total.same_range_parents,
         },
     );
+    for (failed.items) |name| std.debug.print("corpus failure in {s}\n", .{name});
+    try std.testing.expectEqual(@as(usize, 0), failed.items.len);
 }
 
 test "token and node queries over every corpus grammar survive allocation failure" {

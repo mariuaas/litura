@@ -288,3 +288,69 @@ test "tree-sitter enclosing node is null for text before the first token" {
     const inside = (try engine.queryEnclosingSyntaxNode(4, null)).?;
     try std.testing.expect(inside.start <= 4 and inside.end > 4);
 }
+
+test "tree-sitter range queries find the node enclosing sibling nodes" {
+    // `alpha, beta` spans two arguments; no single grapheme's smallest node is their list.
+    const source = "print(alpha, beta)\nx = 1\n";
+    var engine = try BufferEngine.initFromText(std.testing.allocator, source, null);
+    defer engine.deinit();
+    try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "lua"));
+    _ = engine.refreshView("syntax", .unlimited);
+
+    const arguments = (try engine.queryEnclosingSyntaxNodeRange(6, 17, null)).?;
+    try std.testing.expectEqualStrings("arguments", arguments.kind);
+    try std.testing.expectEqual(@as(u32, 5), arguments.start);
+    try std.testing.expectEqual(@as(u32, 18), arguments.end);
+    const call = (try engine.querySyntaxNodeParent(arguments.ref)).?;
+    try std.testing.expectEqualStrings("function_call", call.kind);
+
+    // An empty range asks about one grapheme, exactly as the point query does.
+    const point = (try engine.queryEnclosingSyntaxNode(19, null)).?;
+    const empty = (try engine.queryEnclosingSyntaxNodeRange(19, 19, null)).?;
+    const single = (try engine.queryEnclosingSyntaxNodeRange(19, 20, null)).?;
+    try std.testing.expectEqual(point.ref.id, empty.ref.id);
+    try std.testing.expectEqual(point.ref.id, single.ref.id);
+
+    try std.testing.expectError(error.InvalidRange, engine.queryEnclosingSyntaxNodeRange(4, 3, null));
+    try std.testing.expectError(
+        error.OutOfRange,
+        engine.queryEnclosingSyntaxNodeRange(0, engine.graphemeCount() + 1, null),
+    );
+}
+
+test "tree-sitter parents are reported faithfully, including same-range ancestors" {
+    const source = "print(alpha, beta)\nx = 1\n";
+    var engine = try BufferEngine.initFromText(std.testing.allocator, source, null);
+    defer engine.deinit();
+    try std.testing.expect(try TreeSitterTokenProvider.attachBuiltin(&engine, "lua"));
+    _ = engine.refreshView("syntax", .unlimited);
+
+    // `x` is an identifier inside a variable list with exactly its range: a range query
+    // stops at the identifier, and only the parent query reaches the list.
+    const name = (try engine.queryEnclosingSyntaxNode(19, null)).?;
+    try std.testing.expectEqualStrings("identifier", name.kind);
+    const list = (try engine.querySyntaxNodeParent(name.ref)).?;
+    try std.testing.expectEqualStrings("variable_list", list.kind);
+    try std.testing.expectEqual(name.start, list.start);
+    try std.testing.expectEqual(name.end, list.end);
+    const statement = (try engine.querySyntaxNodeParent(list.ref)).?;
+    try std.testing.expectEqualStrings("assignment_statement", statement.kind);
+
+    // The chain ends at the root, whose parent is absent, not an error.
+    var current = statement;
+    while (try engine.querySyntaxNodeParent(current.ref)) |parent| current = parent;
+    try std.testing.expectEqual(@as(u32, 0), current.ref.id);
+
+    // References the provider does not know are errors.
+    var unknown = name.ref;
+    unknown.id = 1 << 30;
+    try std.testing.expectError(error.KeyError, engine.querySyntaxNodeParent(unknown));
+    var foreign = name.ref;
+    foreign.provider = "tree-sitter-zig";
+    try std.testing.expectError(error.KeyError, engine.querySyntaxNodeParent(foreign));
+
+    // After an edit, old references are rejected and stale views are not queried.
+    try support.edit(&engine, &.{.{ .insert = .{ .pos = 0, .text = "\n" } }});
+    try std.testing.expectError(error.InvalidArgument, engine.querySyntaxNodeParent(name.ref));
+    try std.testing.expectError(error.ViewStale, engine.queryEnclosingSyntaxNodeRange(0, 3, null));
+}

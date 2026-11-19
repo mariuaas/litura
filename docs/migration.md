@@ -85,6 +85,10 @@ Queries no longer refresh. Call `engine.refreshView(view, budget)` first. A quer
 
 `RealizedSplice` gains byte offsets and `events.Point` fields for the same three boundaries. Code that builds splices must fill them in.
 
+Syntax providers implement `enclosingNodeFn(ptr, engine, start, end, revision)`, the smallest node containing a grapheme range (empty only at the end of the text), in place of the point form, and the new `parentNodeFn(ptr, engine, ref)`, the immediate parent or null at the root. A provider that issues no references can return `error.KeyError` from `parentNodeFn`, as from `nodeInfoFn`. `queryEnclosingSyntaxNode(position, revision)` is unchanged for callers; `queryEnclosingSyntaxNodeRange(start, end, revision)` and `querySyntaxNodeParent(ref)` are new.
+
+With `-Dtree-sitter=true`, Litura now builds the Tree-sitter v0.27.2 release instead of a development snapshot from June 2026. A grammar you attach must be compatible with that runtime (ABI 13 to 15).
+
 The built-in Fennel grammar is removed; `attachBuiltin(engine, "fennel")` now returns false. Attach Fennel, or any other language, by compiling its generated parser and passing a `tree_sitter.Grammar` to `TreeSitterTokenProvider.attach`.
 
 ## Observing

@@ -22,6 +22,7 @@ const views = litura.views;
 const types = litura.types;
 const allocator = std.testing.allocator;
 const support = @import("support.zig");
+const structure = @import("syntax_oracle.zig");
 
 /// Halts a refresh after a fixed number of polls.
 const StepBudget = struct {
@@ -120,6 +121,26 @@ fn expectMatchesReference(engine: *BufferEngine, language: []const u8, random: s
         try std.testing.expectEqualStrings(found.kind, resolved.kind);
         try std.testing.expectEqual(found.start, resolved.start);
         try std.testing.expectEqual(found.end, resolved.end);
+    }
+
+    // The smallest node around a random range, and every ancestor of it, against an
+    // independent walk of the provider's tree.
+    var table = try structure.Table.init(allocator, root);
+    defer table.deinit(allocator);
+    if (count > 0) {
+        const start = random.uintLessThan(u32, count);
+        const end = start + 1 + random.uintAtMost(u32, count - start - 1);
+        const node = try engine.queryEnclosingSyntaxNodeRange(start, end, null);
+        const start_byte = try engine.table.byteOffset(start);
+        const expected = table.enclosing(start_byte, try engine.table.byteOffset(end));
+        try std.testing.expectEqual(expected, if (node) |found| found.ref.id else null);
+        var current = node;
+        while (current) |child| {
+            const parent = try engine.querySyntaxNodeParent(child.ref);
+            const parent_id: ?u32 = if (parent) |found| found.ref.id else null;
+            try std.testing.expectEqual(table.parent[child.ref.id], parent_id);
+            current = parent;
+        }
     }
     return exact;
 }
@@ -707,6 +728,9 @@ test "node references are plain values: queries keep no storage and allocate not
         )).?;
         const again = try engine.querySyntaxNodeInfo(node.ref);
         try std.testing.expectEqualStrings(node.kind, again.kind);
+        // Structural queries allocate nothing either.
+        _ = try engine.querySyntaxNodeParent(node.ref);
+        _ = try engine.queryEnclosingSyntaxNodeRange(0, engine.graphemeCount(), null);
     }
     try std.testing.expect(!failing.has_induced_failure);
     failing.fail_index = std.math.maxInt(usize);

@@ -68,6 +68,7 @@ test "view provider registration rejects overlapping views atomically" {
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -77,6 +78,10 @@ test "view provider registration rejects overlapping views atomically" {
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -131,6 +136,7 @@ test "view provider registration rejects overlapping views atomically" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -151,6 +157,7 @@ test "view provider registration rejects overlapping views atomically" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -261,6 +268,7 @@ test "a mutation makes the view stale; queries fail until an explicit refresh" {
             ptr: *anyopaque,
             engine: *anyopaque,
             _: u32,
+            _: u32,
             revision: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -287,6 +295,10 @@ test "a mutation makes the view stale; queries fail until an explicit refresh" {
                 .start = 0,
                 .end = typed_engine.graphemeCount(),
             };
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
+            return null;
         }
 
         fn typeAt(_: *anyopaque, _: *anyopaque, _: u32, _: u32) anyerror!?views.TypeInfo {
@@ -340,6 +352,7 @@ test "a mutation makes the view stale; queries fail until an explicit refresh" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -436,6 +449,7 @@ test "token queries report an unavailable view as an error, not as no tokens" {
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -445,6 +459,10 @@ test "token queries report an unavailable view as an error, not as no tokens" {
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -499,6 +517,7 @@ test "token queries report an unavailable view as an error, not as no tokens" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -590,6 +609,7 @@ test "syntax node refs are revision scoped" {
             _: *anyopaque,
             engine: *anyopaque,
             _: u32,
+            _: u32,
             revision: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             const typed_engine: *BufferEngine = @ptrCast(@alignCast(engine));
@@ -614,6 +634,10 @@ test "syntax node refs are revision scoped" {
                 .start = 0,
                 .end = typed_engine.graphemeCount(),
             };
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
+            return null;
         }
 
         fn typeAt(_: *anyopaque, _: *anyopaque, _: u32, _: u32) anyerror!?views.TypeInfo {
@@ -667,6 +691,7 @@ test "syntax node refs are revision scoped" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -762,6 +787,7 @@ test "type info queries route through provider state and an explicit refresh" {
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -771,6 +797,10 @@ test "type info queries route through provider state and an explicit refresh" {
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -837,6 +867,7 @@ test "type info queries route through provider state and an explicit refresh" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -941,6 +972,7 @@ test "hover queries route through provider state and an explicit refresh" {
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -950,6 +982,10 @@ test "hover queries route through provider state and an explicit refresh" {
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -1018,6 +1054,7 @@ test "hover queries route through provider state and an explicit refresh" {
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -1098,6 +1135,7 @@ test "symbols queries route through provider capabilities and result variants" {
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -1107,6 +1145,10 @@ test "symbols queries route through provider capabilities and result variants" {
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -1186,6 +1228,7 @@ test "symbols queries route through provider capabilities and result variants" {
             .tokenSpansFn = tokenSpans,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .diagnosticListFn = diagnosticList,

@@ -81,11 +81,15 @@ fn noopSemanticTokens(
     return try allocator.alloc(views.SemanticToken, 0);
 }
 
-fn noopEnclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) !?views.SyntaxNodeInfo {
+fn noopEnclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32, _: u32) !?views.SyntaxNodeInfo {
     return null;
 }
 
 fn noopNodeInfo(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) !views.SyntaxNodeInfo {
+    return error.KeyError;
+}
+
+fn noopParentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) !?views.SyntaxNodeInfo {
     return error.KeyError;
 }
 
@@ -583,24 +587,24 @@ pub const TreeSitterTokenProvider = struct {
         return allocator.dupe(views.TokenSpan, raw[0..kept]);
     }
 
-    /// The smallest named node around the grapheme at `position`, or null if no node
-    /// contains it, as for whitespace before the first token. Errors are reported, never
-    /// folded into absence.
+    /// The smallest node containing the graphemes `[start, end)`, preferring named nodes,
+    /// or null if no node contains them, as for whitespace before the first token. Errors
+    /// are reported, never folded into absence.
     fn enclosingNode(
         ptr: *anyopaque,
         engine_ptr: *anyopaque,
-        position: u32,
+        start: u32,
+        end: u32,
         revision: u32,
     ) !?views.SyntaxNodeInfo {
         const self: *TreeSitterTokenProvider = @ptrCast(@alignCast(ptr));
         const engine: *const BufferEngine = @ptrCast(@alignCast(engine_ptr));
         const tree = self.currentTree(revision) orelse return error.ViewStale;
-        const start_byte = try engine.table.byteOffset(position);
-        const end_byte = if (position < engine.graphemeCount())
-            try engine.table.byteOffset(position + 1)
-        else
-            start_byte;
+        const start_byte = try engine.table.byteOffset(start);
+        const end_byte = try engine.table.byteOffset(end);
         const root = tree.rootNode();
+        // Tree-sitter descends to the deepest node containing the range; containing nodes
+        // nest, so that is the smallest.
         var node = root.namedDescendantForByteRange(start_byte, end_byte);
         if (node.isNull() or !node.isNamed()) node = root.descendantForByteRange(start_byte, end_byte);
         if (node.isNull()) return null;
@@ -609,6 +613,26 @@ pub const TreeSitterTokenProvider = struct {
         if (node.startByte() > start_byte or node.endByte() < end_byte) return null;
         const id = descendantIndexOf(root, node) orelse return error.InvalidNode;
         return try self.nodeInfoAt(engine, node, id, revision);
+    }
+
+    /// The visible parent of the referenced node: the node a preorder walk entered it
+    /// from. Time proportional to depth; allocates only through Tree-sitter's allocator.
+    fn parentNode(
+        ptr: *anyopaque,
+        engine_ptr: *anyopaque,
+        ref: views.SyntaxNodeRef,
+    ) !?views.SyntaxNodeInfo {
+        const self: *TreeSitterTokenProvider = @ptrCast(@alignCast(ptr));
+        const engine: *const BufferEngine = @ptrCast(@alignCast(engine_ptr));
+        if (!std.mem.eql(u8, ref.provider, self.grammar.provider_name)) return error.KeyError;
+        const tree = self.currentTree(ref.revision) orelse return error.InvalidArgument;
+        const root = tree.rootNode();
+        if (ref.id >= root.descendantCount()) return error.KeyError;
+        var cursor = ts.TreeCursor.init(root);
+        defer cursor.deinit();
+        cursor.gotoDescendant(ref.id);
+        if (!cursor.gotoParent()) return null;
+        return try self.nodeInfoAt(engine, cursor.node(), cursor.descendantIndex(), ref.revision);
     }
 
     fn nodeInfo(
@@ -864,6 +888,7 @@ pub const TreeSitterTokenProvider = struct {
         .semanticTokensFn = noopSemanticTokens,
         .enclosingNodeFn = noopEnclosingNode,
         .nodeInfoFn = noopNodeInfo,
+        .parentNodeFn = noopParentNode,
         .typeAtFn = noopTypeAt,
         .hoverAtFn = noopHoverAt,
         .symbolCapabilitiesFn = noopSymbolCapabilities,
@@ -884,6 +909,7 @@ pub const TreeSitterTokenProvider = struct {
         .semanticTokensFn = noopSemanticTokens,
         .enclosingNodeFn = enclosingNode,
         .nodeInfoFn = nodeInfo,
+        .parentNodeFn = parentNode,
         .typeAtFn = noopTypeAt,
         .hoverAtFn = noopHoverAt,
         .symbolCapabilitiesFn = noopSymbolCapabilities,

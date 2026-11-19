@@ -824,7 +824,7 @@ test "optional view guards evaluate against available diagnostics and semantic t
             return tokens;
         }
 
-        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32) anyerror!?views.SyntaxNodeInfo {
+        fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32, _: u32) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
 
@@ -833,6 +833,10 @@ test "optional view guards evaluate against available diagnostics and semantic t
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -887,6 +891,7 @@ test "optional view guards evaluate against available diagnostics and semantic t
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,

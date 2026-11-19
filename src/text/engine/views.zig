@@ -180,10 +180,14 @@ pub const ViewProvider = struct {
             end: u32,
             revision: u32,
         ) anyerror![]const SemanticToken,
+        /// The smallest node whose range contains the graphemes `[start, end)`, preferring
+        /// named nodes, or null if none does. The range is empty only at the end of the
+        /// text; the engine turns an empty range elsewhere into its grapheme.
         enclosingNodeFn: *const fn (
             ptr: *anyopaque,
             engine: *anyopaque,
-            position: u32,
+            start: u32,
+            end: u32,
             revision: u32,
         ) anyerror!?SyntaxNodeInfo,
         nodeInfoFn: *const fn (
@@ -191,6 +195,12 @@ pub const ViewProvider = struct {
             engine: *anyopaque,
             ref: SyntaxNodeRef,
         ) anyerror!SyntaxNodeInfo,
+        /// The node's immediate parent, whatever its kind or range, or null at the root.
+        parentNodeFn: *const fn (
+            ptr: *anyopaque,
+            engine: *anyopaque,
+            ref: SyntaxNodeRef,
+        ) anyerror!?SyntaxNodeInfo,
         typeAtFn: *const fn (
             ptr: *anyopaque,
             engine: *anyopaque,
@@ -271,10 +281,11 @@ pub const ViewProvider = struct {
     pub fn enclosingNode(
         self: ViewProvider,
         engine: *anyopaque,
-        position: u32,
+        start: u32,
+        end: u32,
         revision: u32,
     ) !?SyntaxNodeInfo {
-        return self.vtable.enclosingNodeFn(self.ptr, engine, position, revision);
+        return self.vtable.enclosingNodeFn(self.ptr, engine, start, end, revision);
     }
 
     pub fn diagnosticList(
@@ -301,6 +312,10 @@ pub const ViewProvider = struct {
 
     pub fn nodeInfo(self: ViewProvider, engine: *anyopaque, ref: SyntaxNodeRef) !SyntaxNodeInfo {
         return self.vtable.nodeInfoFn(self.ptr, engine, ref);
+    }
+
+    pub fn parentNode(self: ViewProvider, engine: *anyopaque, ref: SyntaxNodeRef) !?SyntaxNodeInfo {
+        return self.vtable.parentNodeFn(self.ptr, engine, ref);
     }
 
     pub fn typeAt(self: ViewProvider, engine: *anyopaque, position: u32, revision: u32) !?TypeInfo {
@@ -372,6 +387,7 @@ pub const StaticTokenProvider = struct {
         .semanticTokensFn = semanticTokens,
         .enclosingNodeFn = enclosingNode,
         .nodeInfoFn = nodeInfo,
+        .parentNodeFn = parentNode,
         .typeAtFn = typeAt,
         .hoverAtFn = hoverAt,
         .symbolCapabilitiesFn = symbolCapabilities,
@@ -448,16 +464,7 @@ pub const StaticTokenProvider = struct {
         return results.toOwnedSlice(allocator);
     }
 
-    fn enclosingNode(
-        ptr: *anyopaque,
-        engine: *anyopaque,
-        position: u32,
-        revision: u32,
-    ) !?SyntaxNodeInfo {
-        _ = ptr;
-        _ = engine;
-        _ = position;
-        _ = revision;
+    fn enclosingNode(_: *anyopaque, _: *anyopaque, _: u32, _: u32, _: u32) !?SyntaxNodeInfo {
         return null;
     }
 
@@ -465,6 +472,10 @@ pub const StaticTokenProvider = struct {
         _ = ptr;
         _ = engine;
         _ = ref;
+        return error.KeyError;
+    }
+
+    fn parentNode(_: *anyopaque, _: *anyopaque, _: SyntaxNodeRef) anyerror!?SyntaxNodeInfo {
         return error.KeyError;
     }
 

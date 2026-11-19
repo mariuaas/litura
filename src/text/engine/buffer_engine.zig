@@ -1868,20 +1868,36 @@ pub const BufferEngine = struct {
         );
     }
 
-    /// The smallest named node around the grapheme at `position`, or null when there is
-    /// none or no syntax provider. Errors (a view that is not current, allocation
-    /// failure) are reported as errors, never as absence.
+    /// The smallest node around the grapheme at `position`, preferring named nodes, or null
+    /// when no node contains it or there is no syntax provider. At the end of the text,
+    /// the node at that point. Errors (a view that is not current, allocation failure)
+    /// are reported as errors, never as absence.
     pub fn queryEnclosingSyntaxNode(
         self: *BufferEngine,
         position: u32,
         revision: ?u32,
     ) !?views.SyntaxNodeInfo {
+        return self.queryEnclosingSyntaxNodeRange(position, position, revision);
+    }
+
+    /// The smallest node whose range contains the graphemes `[start, end)`, preferring
+    /// named nodes, or null when none does or there is no syntax provider. An empty range
+    /// asks about the grapheme at `start`, as `queryEnclosingSyntaxNode` does.
+    pub fn queryEnclosingSyntaxNodeRange(
+        self: *BufferEngine,
+        start: u32,
+        end: u32,
+        revision: ?u32,
+    ) !?views.SyntaxNodeInfo {
         const requested_revision = revision orelse self.revision;
         if (requested_revision != self.revision) return error.InvalidArgument;
-        try self.table.validatePosition(position);
+        if (start > end) return error.InvalidRange;
+        try self.table.validatePosition(end);
 
         const provider = try self.currentProvider("syntax") orelse return null;
-        return try provider.enclosingNode(@ptrCast(self), position, self.revision);
+        // Providers see an empty range only at the end of the text.
+        const effective_end = if (start == end and start < self.graphemeCount()) start + 1 else end;
+        return try provider.enclosingNode(@ptrCast(self), start, effective_end, self.revision);
     }
 
     /// Resolves a node reference. A reference from another revision is rejected with
@@ -1893,6 +1909,19 @@ pub const BufferEngine = struct {
         if (ref.revision != self.revision) return error.InvalidArgument;
         const provider = try self.currentProvider("syntax") orelse return error.KeyError;
         return provider.nodeInfo(@ptrCast(self), ref);
+    }
+
+    /// The immediate parent of a node, reported faithfully: an anonymous node or one with
+    /// the same range is still the parent. Null at the root. A reference from another
+    /// revision is rejected with error.InvalidArgument; one the provider does not know,
+    /// with error.KeyError.
+    pub fn querySyntaxNodeParent(
+        self: *BufferEngine,
+        ref: views.SyntaxNodeRef,
+    ) !?views.SyntaxNodeInfo {
+        if (ref.revision != self.revision) return error.InvalidArgument;
+        const provider = try self.currentProvider("syntax") orelse return error.KeyError;
+        return provider.parentNode(@ptrCast(self), ref);
     }
 
     pub fn queryTypeAt(self: *BufferEngine, position: u32, revision: ?u32) !?views.TypeInfo {
@@ -2063,6 +2092,7 @@ test "rollbackRegisteredViews removes inserted views without freeing borrowed ke
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -2072,6 +2102,10 @@ test "rollbackRegisteredViews removes inserted views without freeing borrowed ke
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -2126,6 +2160,7 @@ test "rollbackRegisteredViews removes inserted views without freeing borrowed ke
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -2206,6 +2241,7 @@ test "registerViewProviders rolls back partial registration when a later put fai
             _: *anyopaque,
             _: u32,
             _: u32,
+            _: u32,
         ) anyerror!?views.SyntaxNodeInfo {
             return null;
         }
@@ -2215,6 +2251,10 @@ test "registerViewProviders rolls back partial registration when a later put fai
             _: *anyopaque,
             _: views.SyntaxNodeRef,
         ) anyerror!views.SyntaxNodeInfo {
+            return error.KeyError;
+        }
+
+        fn parentNode(_: *anyopaque, _: *anyopaque, _: views.SyntaxNodeRef) anyerror!?views.SyntaxNodeInfo {
             return error.KeyError;
         }
 
@@ -2269,6 +2309,7 @@ test "registerViewProviders rolls back partial registration when a later put fai
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,
@@ -2289,6 +2330,7 @@ test "registerViewProviders rolls back partial registration when a later put fai
             .semanticTokensFn = semanticTokens,
             .enclosingNodeFn = enclosingNode,
             .nodeInfoFn = nodeInfo,
+            .parentNodeFn = parentNode,
             .typeAtFn = typeAt,
             .hoverAtFn = hoverAt,
             .symbolCapabilitiesFn = symbolCapabilities,

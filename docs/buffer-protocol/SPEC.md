@@ -809,9 +809,16 @@ A reference is a plain value. Issuing, copying and discarding references
 requires no storage in the engine or the provider, so a client may keep as
 many as it likes for as long as their revision is current.
 
-`query_enclosing_syntax_node` returns the smallest node whose range contains
-the grapheme at the position, preferring named nodes, or `None` when no node
-contains it (for example, whitespace before the first token). A provider error
+`query_enclosing_syntax_node` returns the smallest node whose range contains a
+range, preferring named nodes, or `None` when no node contains it (for example,
+whitespace before the first token). An empty range `[p, p)` asks about the
+grapheme at `p`; the point form is that case. `query_syntax_node_parent`
+returns a node's immediate parent, reported faithfully: an anonymous parent or
+one with the same range as its child is still the parent. It returns `None`
+only at the root. Together they give a node's whole ancestry, which repeated
+point queries cannot: an ancestor with the same range as its child contains no
+grapheme that its child does not. Which ancestors make meaningful steps, for
+example when expanding a selection, is the client's decision. A provider error
 is an error, not `None`.
 
 Syntax node kinds are normalized strings. Engines may choose the granularity
@@ -1967,8 +1974,9 @@ query_summary(buffer, revision, range) -> Summary
 query_anchor(buffer, anchor_id) -> AnchorInfo
 query_view_state(buffer, view) -> ViewState
 query_token_spans(buffer, revision, range) -> TokenSpan[]
-query_enclosing_syntax_node(buffer, revision, position) -> SyntaxNodeInfo | None
+query_enclosing_syntax_node(buffer, revision, range) -> SyntaxNodeInfo | None
 query_syntax_node_info(buffer, ref) -> SyntaxNodeInfo
+query_syntax_node_parent(buffer, ref) -> SyntaxNodeInfo | None
 query_diagnostic_list(buffer, revision, range: Range | None) -> Diagnostic[]
 query_semantic_tokens(buffer, revision, range) -> SemanticToken[]
 query_type_at(buffer, revision, position) -> TypeResult | None

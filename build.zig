@@ -45,11 +45,17 @@ pub fn build(b: *std.Build) void {
         "syntax-corpus-steps",
         "Random edit steps per corpus document (default 12)",
     ) orelse 12;
+    const syntax_corpus_seed = b.option(
+        u64,
+        "syntax-corpus-seed",
+        "Base seed of the corpus workloads, in decimal (default 1592639710, 0x5eedc0de)",
+    ) orelse 0x5eed_c0de;
     const tests = behavioralTests(b, module, zg, target, optimize, conformance_stride);
     if (syntax_corpus and !addSyntaxCorpus(b, tests, module)) return;
     const corpus_options = b.addOptions();
     corpus_options.addOption(bool, "enabled", syntax_corpus);
     corpus_options.addOption(u32, "steps", syntax_corpus_steps);
+    corpus_options.addOption(u64, "seed", syntax_corpus_seed);
     tests.root_module.addOptions("syntax_corpus_options", corpus_options);
     const units = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/unit_tests.zig"),
@@ -79,6 +85,7 @@ pub fn build(b: *std.Build) void {
     const no_corpus = b.addOptions();
     no_corpus.addOption(bool, "enabled", false);
     no_corpus.addOption(u32, "steps", 0);
+    no_corpus.addOption(u64, "seed", 0);
     conformance_tests.root_module.addOptions("syntax_corpus_options", no_corpus);
     conformance.dependOn(&b.addRunArtifact(conformance_tests).step);
 
