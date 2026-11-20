@@ -7,13 +7,17 @@
 //! over random windows, and its enclosing nodes at random positions are compared with a
 //! fresh engine that parses the same text from scratch.
 //!
-//! The trees must match exactly whenever the text parses without errors, both for
-//! uninterrupted refreshes and for refreshes under budgets that halt parses partway, with
-//! edits sometimes arriving while a parse is halted. Inside syntax errors Tree-sitter's
-//! recovery depends on which old nodes it reuses and on where a halted parse resumed, so
-//! an incremental parse may recover differently from a fresh one (docs/known-issues.md);
-//! the views must still be consistent with their own tree. A second workload makes only
-//! edits that keep long documents valid, so that every comparison there is exact.
+//! Where the text parses without errors the trees must match exactly, for uninterrupted
+//! refreshes and for refreshes under budgets that halt parses partway, with edits
+//! sometimes arriving while a parse is halted. That holds for these grammars and seeds;
+//! in general Tree-sitter's incremental result can depend on its edit and resume history
+//! (docs/known-issues.md). Inside syntax errors it often does, so there the views must
+//! only be consistent with their own tree. A second workload makes only edits that keep
+//! long documents valid, so that every comparison there is exact.
+//!
+//! These workloads are sized for the default test run. The grammar-diversity suite
+//! (`-Dsyntax-corpus=true`) runs Lua and Zig in depth, with the mirror that checks the
+//! provider against raw Tree-sitter.
 const std = @import("std");
 const litura = @import("litura");
 const BufferEngine = litura.BufferEngine;
@@ -312,7 +316,7 @@ test "incremental Lua views match a full reparse through edits, undo, redo and h
         "\u{1f44d}\u{1f3fd}",
         "x",
     };
-    try run("lua", source, &fragments, 0x1a7a, 150);
+    try run("lua", source, &fragments, 0x1a7a, 60);
 }
 
 test "incremental Zig views match a full reparse through edits, undo, redo and halted parses" {
@@ -341,7 +345,7 @@ test "incremental Zig views match a full reparse through edits, undo, redo and h
         "\u{1f1f3}\u{1f1f4}",
         "x",
     };
-    try run("zig", source, &fragments, 0x2196, 150);
+    try run("zig", source, &fragments, 0x2196, 30);
 }
 
 /// `count` copies of `item`, each formatted with its index: a long top-level list, which
@@ -505,7 +509,7 @@ fn runValid(
         };
         try workload.refresh();
         try std.testing.expect(try expectMatchesReference(&engine, language, workload.random));
-        for (0..60) |_| {
+        for (0..30) |_| {
             try workload.step();
             try workload.refresh();
             try std.testing.expect(try expectMatchesReference(&engine, language, workload.random));
@@ -518,7 +522,7 @@ test "incremental views over long valid documents match a full reparse exactly" 
         \\-- helper ✓ {d}
         \\local function f_{d}(a) return a * 2 end
         \\
-    , 120);
+    , 40);
     defer allocator.free(lua);
     try runValid(
         "lua",
@@ -532,7 +536,7 @@ test "incremental views over long valid documents match a full reparse exactly" 
         \\/// doc ✓ {d}
         \\fn f_{d}(a: u32) u32 {{ return a * 2; }}
         \\
-    , 120);
+    , 40);
     defer allocator.free(zig);
     try runValid(
         "zig",
@@ -548,7 +552,7 @@ test "incremental views over long top-level lists match a full reparse" {
         \\-- helper {d}
         \\local function f_{d}(a) return a * 2 end
         \\
-    , 120);
+    , 40);
     defer allocator.free(lua);
     const lua_fragments = [_][]const u8{
         "--[[ ",
@@ -560,13 +564,13 @@ test "incremental views over long top-level lists match a full reparse" {
         "(",
         "e\u{0301}",
     };
-    try run("lua", lua, &lua_fragments, 0x7e9e, 50);
+    try run("lua", lua, &lua_fragments, 0x7e9e, 20);
 
     const zig = try longList(
         \\/// doc {d}
         \\fn f_{d}(a: u32) u32 {{ return a * 2; }}
         \\
-    , 120);
+    , 40);
     defer allocator.free(zig);
     const zig_fragments = [_][]const u8{
         "}",
@@ -578,7 +582,7 @@ test "incremental views over long top-level lists match a full reparse" {
         "\"",
         "e\u{0301}",
     };
-    try run("zig", zig, &zig_fragments, 0x2e9e, 50);
+    try run("zig", zig, &zig_fragments, 0x2e9e, 20);
 }
 
 test "queries never parse, and stale views are reported as stale" {

@@ -48,6 +48,13 @@ const allocator = std.testing.allocator;
 
 const base_seed: u64 = options.seed;
 
+/// Whether this run covers `name`: the build runs the suite once per grammar, naming it in
+/// `LITURA_SYNTAX_CORPUS_GRAMMAR`. Every grammar when the variable is unset.
+fn selected(name: []const u8) bool {
+    const wanted = std.c.getenv("LITURA_SYNTAX_CORPUS_GRAMMAR") orelse return true;
+    return std.mem.eql(u8, std.mem.span(wanted), name);
+}
+
 /// Halts a refresh after a fixed number of progress checks.
 const StepBudget = struct {
     remaining: u32,
@@ -769,6 +776,7 @@ test "syntax views agree with full reparsing across the grammar corpus" {
     var failed: std.ArrayListUnmanaged([]const u8) = .empty;
     defer failed.deinit(allocator);
     grammars: for (&corpus.entries, 0..) |*entry, grammar_index| {
+        if (!selected(entry.name)) continue;
         var stats: Stats = .{};
         var examples: std.ArrayListUnmanaged([]const u8) = .empty;
         defer examples.deinit(allocator);
@@ -841,6 +849,7 @@ test "token and node queries over every corpus grammar survive allocation failur
     // turn; each either succeeds with the correct answer or reports OutOfMemory, and
     // the view stays available.
     for (&corpus.entries) |*entry| {
+        if (!selected(entry.name)) continue;
         var failing = std.testing.FailingAllocator.init(allocator, .{});
         var engine = try BufferEngine.initFromText(failing.allocator(), entry.sample, null);
         defer engine.deinit();

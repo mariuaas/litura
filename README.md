@@ -35,7 +35,7 @@ zig build test -Dtree-sitter=true
 zig build example -Dtree-sitter=true
 ```
 
-`-Dsyntax-corpus=true` runs the views against further grammars pinned as test fixtures and fetched only for that run. Use `-Doptimize=ReleaseSafe`; it keeps the run to minutes.
+`-Dsyntax-corpus=true` runs the views against further grammars pinned as test fixtures and fetched only for that run. Each grammar runs as its own test step, in parallel. Use `-Doptimize=ReleaseSafe`: the run then takes about five minutes on a laptop, against hours in Debug.
 
 The core uses `zg` for Unicode handling and runs independently of Substrate's application runtime.
 

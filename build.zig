@@ -51,12 +51,6 @@ pub fn build(b: *std.Build) void {
         "Base seed of the corpus workloads, in decimal (default 1592639710, 0x5eedc0de)",
     ) orelse 0x5eed_c0de;
     const tests = behavioralTests(b, module, zg, target, optimize, conformance_stride);
-    if (syntax_corpus and !addSyntaxCorpus(b, tests, module)) return;
-    const corpus_options = b.addOptions();
-    corpus_options.addOption(bool, "enabled", syntax_corpus);
-    corpus_options.addOption(u32, "steps", syntax_corpus_steps);
-    corpus_options.addOption(u64, "seed", syntax_corpus_seed);
-    tests.root_module.addOptions("syntax_corpus_options", corpus_options);
     const units = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/unit_tests.zig"),
         .target = target,
@@ -77,16 +71,34 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_units.step);
 
+    // The corpus is its own test executable, run once per grammar so that the runs
+    // proceed in parallel; each reads its grammar from the environment.
+    if (syntax_corpus) {
+        const corpus_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/syntax_corpus_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        corpus_tests.root_module.addImport("litura", module);
+        const corpus_options = b.addOptions();
+        corpus_options.addOption(u32, "steps", syntax_corpus_steps);
+        corpus_options.addOption(u64, "seed", syntax_corpus_seed);
+        corpus_tests.root_module.addOptions("syntax_corpus_options", corpus_options);
+        if (!addSyntaxCorpus(b, corpus_tests, module)) return;
+        check.dependOn(&corpus_tests.step);
+        for (corpus_grammars) |grammar| {
+            const run = b.addRunArtifact(corpus_tests);
+            run.setName(b.fmt("syntax corpus {s}", .{grammar.name}));
+            run.setEnvironmentVariable("LITURA_SYNTAX_CORPUS_GRAMMAR", grammar.name);
+            test_step.dependOn(&run.step);
+        }
+    }
+
     const conformance = b.step(
         "conformance",
         "Run behavioral tests against every Unicode grapheme conformance case",
     );
     const conformance_tests = behavioralTests(b, module, zg, target, optimize, 1);
-    const no_corpus = b.addOptions();
-    no_corpus.addOption(bool, "enabled", false);
-    no_corpus.addOption(u32, "steps", 0);
-    no_corpus.addOption(u64, "seed", 0);
-    conformance_tests.root_module.addOptions("syntax_corpus_options", no_corpus);
     conformance.dependOn(&b.addRunArtifact(conformance_tests).step);
 
     const example = b.addExecutable(.{ .name = "litura-basic", .root_module = b.createModule(.{
@@ -208,6 +220,9 @@ const CorpusGrammar = struct {
     corpus: ?[]const u8,
     /// A larger hand-written document, under `tests/syntax_corpus/samples`.
     sample: []const u8,
+    /// The index of a grammar Litura builds in (`tree_sitter.builtin_grammars`), whose
+    /// parser and query the library already provides.
+    builtin: ?usize = null,
 
     const QueryFile = struct { package: ?[]const u8 = null, path: []const u8 };
 };
@@ -384,6 +399,29 @@ const corpus_grammars = [_]CorpusGrammar{
         .corpus = null,
         .sample = "perl.pl",
     },
+    // Litura's built-in grammars, appended so that the others keep their seeds.
+    .{
+        .name = "lua",
+        .package = "tree_sitter_lua",
+        .version = "10fe0054",
+        .src = "src",
+        .scanner = false,
+        .highlights = &.{},
+        .corpus = "test/corpus",
+        .sample = "lua.lua",
+        .builtin = 0,
+    },
+    .{
+        .name = "zig",
+        .package = "tree_sitter_zig",
+        .version = "6479aa13",
+        .src = "",
+        .scanner = false,
+        .highlights = &.{},
+        .corpus = null,
+        .sample = "zig.zig",
+        .builtin = 1,
+    },
 };
 
 /// Compiles the corpus grammars into `tests` and gives it a generated `syntax_corpus`
@@ -411,6 +449,15 @@ fn addSyntaxCorpus(b: *std.Build, tests: *std.Build.Step.Compile, litura: *std.B
     var externs: std.ArrayList(u8) = .empty;
     for (corpus_grammars) |grammar| {
         const package = b.lazyDependency(grammar.package, .{}) orelse return false;
+        if (grammar.builtin) |index| {
+            append(b, w, "    .{{ .name = \"{s}\", .version = \"{s}\", ", .{
+                grammar.name,
+                grammar.version,
+            });
+            append(b, w, ".grammar = litura.tree_sitter.builtin_grammars[{d}],\n", .{index});
+            appendDocuments(b, w, files, package, grammar);
+            continue;
+        }
         // Most of these scanners define `create()` without a prototype; calls through
         // Tree-sitter's `void *(*)(void)` are valid C but trip -fsanitize=function. The
         // fixtures are optimized in every mode: they are not under test, and lexing
@@ -453,18 +500,8 @@ fn addSyntaxCorpus(b: *std.Build, tests: *std.Build.Step.Compile, litura: *std.B
             _ = files.addCopyFile(path, copied);
             append(b, w, " ++ @embedFile(\"{s}\") ++ \"\\n\"", .{copied});
         }
-        append(b, w, ",\n    }},\n        .corpus = &.{{", .{});
-        if (grammar.corpus) |directory| {
-            for (corpusFiles(b, package.path(directory))) |name| {
-                const copied = b.fmt("{s}/corpus/{s}", .{ grammar.name, name });
-                _ = files.addCopyFile(package.path(b.fmt("{s}/{s}", .{ directory, name })), copied);
-                append(b, w, " @embedFile(\"{s}\"),", .{copied});
-            }
-        }
-        const sample = b.fmt("{s}/sample", .{grammar.name});
-        const sample_path = b.path(b.fmt("tests/syntax_corpus/samples/{s}", .{grammar.sample}));
-        _ = files.addCopyFile(sample_path, sample);
-        append(b, w, " }},\n        .sample = @embedFile(\"{s}\"),\n    }},\n", .{sample});
+        append(b, w, ",\n    }},\n", .{});
+        appendDocuments(b, w, files, package, grammar);
     }
     append(b, w, "}};\n\n{s}", .{externs.items});
     const root = files.add("corpus.zig", source.items);
@@ -472,6 +509,28 @@ fn addSyntaxCorpus(b: *std.Build, tests: *std.Build.Step.Compile, litura: *std.B
     corpus.addImport("litura", litura);
     tests.root_module.addImport("syntax_corpus", corpus);
     return true;
+}
+
+/// The rest of a generated entry: the grammar's corpus files and its sample.
+fn appendDocuments(
+    b: *std.Build,
+    w: *std.ArrayList(u8),
+    files: *std.Build.Step.WriteFile,
+    package: *std.Build.Dependency,
+    grammar: CorpusGrammar,
+) void {
+    append(b, w, "        .corpus = &.{{", .{});
+    if (grammar.corpus) |directory| {
+        for (corpusFiles(b, package.path(directory))) |name| {
+            const copied = b.fmt("{s}/corpus/{s}", .{ grammar.name, name });
+            _ = files.addCopyFile(package.path(b.fmt("{s}/{s}", .{ directory, name })), copied);
+            append(b, w, " @embedFile(\"{s}\"),", .{copied});
+        }
+    }
+    const sample = b.fmt("{s}/sample", .{grammar.name});
+    const sample_path = b.path(b.fmt("tests/syntax_corpus/samples/{s}", .{grammar.sample}));
+    _ = files.addCopyFile(sample_path, sample);
+    append(b, w, " }},\n        .sample = @embedFile(\"{s}\"),\n    }},\n", .{sample});
 }
 
 fn append(b: *std.Build, list: *std.ArrayList(u8), comptime format: []const u8, args: anytype) void {

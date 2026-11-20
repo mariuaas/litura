@@ -116,7 +116,8 @@ overtaken by an edit after every call, allocation-free node references, and allo
 in token queries and while a parse is halted.
 
 The grammar-diversity suite (`-Dsyntax-corpus=true`, `tests/syntax_corpus_test.zig`) runs
-over fourteen grammars pinned as test fixtures: each grammar's own corpus and a hand-written
+over fourteen grammars pinned as test fixtures, and over Lua and Zig, in one test run per
+grammar so that they proceed in parallel: each grammar's own corpus and a hand-written
 sample, under random edits, refreshed both uninterrupted and in budgeted calls with edits
 arriving between them. Edits, the refresh schedule and the checks draw on separate random
 streams, and nothing in the schedule depends on parser outcomes, so a seed gives every
